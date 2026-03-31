@@ -265,9 +265,3 @@ After login, the client automatically begins synchronization with the server.
 • Resume interrupted transfers
 • Cross-platform support (Windows/macOS)
 • Replace polling loops with event-driven networking
-
----
-
-## Summary
-
-This project demonstrates a full distributed file synchronization pipeline including authentication, filesystem monitoring, packet protocol design, multithreading, and TCP networking in C++. It serves as a solid foundation for more advanced cloud-sync or backup systems.
