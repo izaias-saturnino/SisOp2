@@ -249,19 +249,17 @@ After login, the client automatically begins synchronization with the server.
 
 ## Known Limitations
 
-• No encryption (plain TCP)
-• No checksum verification for file integrity
-• No conflict resolution (last write wins)
-• Limited error handling for network failures
-• File transfers do not support resume
+* No encryption (plain TCP)
+* No checksum verification for file integrity
+* No conflict resolution (last write wins)
+* File transfers do not support resume
 
 ---
 
 ## Possible Improvements
 
-• Add TLS encryption
-• Implement file hashing and integrity checks
-• Conflict detection and versioning
-• Resume interrupted transfers
-• Cross-platform support (Windows/macOS)
-• Replace polling loops with event-driven networking
+* Add TLS encryption
+* Implement file hashing and integrity checks
+* Conflict detection and versioning
+* Resume interrupted transfers
+* Replace polling loops with event-driven networking
