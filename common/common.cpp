@@ -9,60 +9,40 @@ int sendpktnum = 0;
 
 void serialize(PACKET *pkt, char data[sizeof(PACKET)])
 {
-    char *q = (char*)data;
-    *q = pkt->type;
-	q += sizeof(pkt->type);
-	*q = pkt->seqn;
-	q += sizeof(pkt->seqn);
-	*q = pkt->file_byte_size;
-	q += sizeof(pkt->file_byte_size);
+    int offset = 0;
 
-    char *p = (char*)q;
-    int i = 0;
-    while (i < BUFFER_SIZE)
-    {
-        *p = pkt->user[i];
-        p++;
-        i++;
-    }
+    memcpy(data + offset, &pkt->type, sizeof(pkt->type));
+    offset += sizeof(pkt->type);
 
-	char *r = (char*)p;
-    i = 0;
-    while (i < BUFFER_SIZE)
-    {
-        *r = pkt->_payload[i];
-        r++;
-        i++;
-    }
+    memcpy(data + offset, &pkt->seqn, sizeof(pkt->seqn));
+    offset += sizeof(pkt->seqn);
+
+    memcpy(data + offset, &pkt->file_byte_size, sizeof(pkt->file_byte_size));
+    offset += sizeof(pkt->file_byte_size);
+
+    memcpy(data + offset, pkt->user, BUFFER_SIZE);
+    offset += BUFFER_SIZE;
+
+    memcpy(data + offset, pkt->_payload, BUFFER_SIZE);
 }
 
 void deserialize(PACKET *pkt, char data[sizeof(PACKET)])
 {
-    char *q = (char*)data;
-    pkt->type = *q;
-	q += sizeof(pkt->type);
-	pkt->seqn = *q;
-	q += sizeof(pkt->seqn);
-	pkt->file_byte_size = *q;
-	q += sizeof(pkt->file_byte_size);
+    int offset = 0;
 
-    char *p = (char*)q;
-    int i = 0;
-    while (i < BUFFER_SIZE)
-    {
-        pkt->user[i] = *p;
-    	p++;
-        i++;
-    }
+    memcpy(&pkt->type, data + offset, sizeof(pkt->type));
+    offset += sizeof(pkt->type);
 
-	char *r = (char*)p;
-    i = 0;
-    while (i < BUFFER_SIZE)
-    {
-        pkt->_payload[i] = *r;
-        r++;
-        i++;
-    }
+    memcpy(&pkt->seqn, data + offset, sizeof(pkt->seqn));
+    offset += sizeof(pkt->seqn);
+
+    memcpy(&pkt->file_byte_size, data + offset, sizeof(pkt->file_byte_size));
+    offset += sizeof(pkt->file_byte_size);
+
+    memcpy(pkt->user, data + offset, BUFFER_SIZE);
+    offset += BUFFER_SIZE;
+
+    memcpy(pkt->_payload, data + offset, BUFFER_SIZE);
 }
 
 int readSocket(PACKET *pkt, int sock){
