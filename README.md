@@ -10,14 +10,14 @@ The architecture is based on TCP sockets, custom packet serialization, multithre
 
 ## Main Features
 
-• User authentication with session management
-• Two simultaneous client sessions per user
-• Automatic detection of file changes (create, delete, modify, move)
-• Bidirectional file synchronization between client and server
-• Initial full synchronization when client connects
-• Incremental synchronization during runtime
-• Custom reliable packet protocol over TCP
-• Multi-threaded client and server design
+* User authentication with session management
+* Two simultaneous client sessions per user
+* Automatic detection of file changes (create, delete, modify, move)
+* Bidirectional file synchronization between client and server
+* Initial full synchronization when client connects
+* Incremental synchronization during runtime
+* Custom reliable packet protocol over TCP
+* Multi-threaded client and server design
 
 ---
 
