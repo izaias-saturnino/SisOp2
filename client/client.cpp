@@ -2,23 +2,22 @@
 bool Logout = false;
 int socketCtrl = -1;
 int socketCtrl2 = -1;
-char username[BUFFER_SIZE];
 
 vector<string> latest_downloads = {};
 
 bool wait_for_first_sync = true;
 
+ALIVE* servAlive;
+bool connected = true;
+
 int main(int argc, char *argv[])
 {
 	bool sync_dir_active = false;
 
-	int sockfd, PORT, newSocket, sockfd_sync;
+	int sockfd_sync;
 	socklen_t clilen;
-	char buffer[BUFFER_SIZE];
-	struct sockaddr_in serv_addr, cli_addr;
 	struct sigaction sigIntHandler;
 	PACKET receivedPkt;
-	string message, servAddr;
 
 	sigIntHandler.sa_handler = handle_ctrlc;
 	sigemptyset(&sigIntHandler.sa_mask);
@@ -26,72 +25,71 @@ int main(int argc, char *argv[])
 
 	verificaRecebimentoParametros(argc);
 
+	servAlive = (ALIVE *)malloc(sizeof(ALIVE));
+
+	// char* server_ip = argv[2];
+	// hostent *server_host = gethostbyname(server_ip);
+	// int PORT = atoi(argv[3]);
+	// int sockfd = connect_to_server(*server_host, PORT);
+	servAlive->server_ip = argv[2];
+	servAlive->server_host = gethostbyname((servAlive->server_ip).c_str());
+	servAlive->PORT = atoi(argv[3]);
+	servAlive->sockfd = connect_to_server(*servAlive->server_host, servAlive->PORT);
+	
+	if (servAlive->sockfd  == -1)
+	{
+		exit(0);
+	}
+
+	socketCtrl = servAlive->sockfd ;
+
+	char username[BUFFER_SIZE];
 	strcpy(username, argv[1]);
-	PORT = atoi(argv[3]);
-	servAddr = string(argv[2]);
 
-	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-	{
-		printf("ERROR opening socket");
-		exit(0);
-	}
-
-	socketCtrl = sockfd;
-
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(PORT);
-	inet_aton(servAddr.c_str(), &serv_addr.sin_addr);
-	bzero(&(serv_addr.sin_zero), 8);
-
-	if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-	{
-		printf("ERROR connecting\n");
-		exit(0);
-	}
-
-	bzero(buffer, BUFFER_SIZE);
-
-
-	sendMessage("", 1, MENSAGEM_LOGIN, 1, username, sockfd); // login message
-	readSocket(&receivedPkt, sockfd);
+	cout << "send login" << endl;
+	sendMessage(username, MENSAGEM_LOGIN, servAlive->sockfd ); // login message
+	cout << "read login" << endl;
+	readSocket(&receivedPkt, servAlive->sockfd );
 
 	if (receivedPkt.type == MENSAGEM_USUARIO_VALIDO)
 	{
-		pthread_t thr1, thr2, thr3;
+		pthread_t thr,thr1, thr2, thr3;
 		int n1 = 1;
 		int n2 = 2;
 
-		while (pthread_create(&thr2, NULL, input, (void *)&n2) != 0)
-		{
-			//cout << "ERROR creating input thread. retrying..." << endl;
-		}
+		cout << "creating input thread" << endl;
+		create_thread(&thr2, NULL, input, (void *)&n2);
 
 		cout << "type exit to end your session \n"
 			 << endl;
+
+		create_thread(&thr, NULL, verificaServer,&receivedPkt); 
 		while (true)
 		{
-			//cout<<"size of packet"<<sizeof(PACKET)<<endl;
+			//cout<<"size of packet: " << sizeof(PACKET) << endl;
 			sigaction(SIGINT, &sigIntHandler, NULL);
 
 			if (action.size() > 0 && sync_dir_active)
 			{
 				mtx_file_manipulation.lock();
-				//cout << "action size: " << action.size() << endl;
+				cout << "action size: " << action.size() << endl;
 				for (int i = 0; i < action.size(); i++)
 				{
-					//std::cout << "action: " << action[i] << " & name: " << name[i] << "\n";
+					cout << "action: " << action[i] << " & name: " << name[i] << "\n";
 					if (action[i] == FILE_CREATED || action[i] == FILE_MODIFIED)
 					{
 						if (find(latest_downloads.begin(), latest_downloads.end(), name[i]) != latest_downloads.end())
 						{
 							continue;
 						}
-						upload_to_server(sockfd, username, "./sync_dir/" + name[i], true);
+						cout << "write111" << endl;
+						sendMessage("", MENSAGEM_ENVIO_SYNC, servAlive->sockfd );
+						upload_to_server(servAlive->sockfd , "./sync_dir/" + name[i]);
 					}
 					if (action[i] == FILE_DELETED)
 					{
-						//cout << "write1" << endl;
-						sendMessage((char *)("./sync_dir/" + name[i]).c_str(), 1, MENSAGEM_DELETAR_NO_SERVIDOR, 1, username, sockfd);
+						cout << "write1" << endl;
+						sendMessage((char *)("./sync_dir/" + name[i]).c_str(), MENSAGEM_DELETAR_NO_SERVIDOR, servAlive->sockfd);
 					}
 				}
 				latest_downloads.clear();
@@ -102,7 +100,7 @@ int main(int argc, char *argv[])
 			//cout << "command before thread:" << command << endl;
 			if (command_complete)
 			{
-				//cout << "command inside main thread:" << command << endl;
+				cout << "command inside main thread:" << command << endl;
 				if (command == "exit" || Logout == true)
 				{
 					cout << "exiting application..." << endl;
@@ -117,29 +115,32 @@ int main(int argc, char *argv[])
 				else if (command == "list_server")
 				{
 					cout << "sending list request" << endl;
-					sendMessage("", 1, MENSAGEM_PEDIDO_LISTA_ARQUIVOS_SERVIDOR, 1, username, sockfd);
+					sendMessage("", MENSAGEM_PEDIDO_LISTA_ARQUIVOS_SERVIDOR, servAlive->sockfd );
 
-					//cout << "read2" << endl;
-					int result = readSocket(&receivedPkt, sockfd);
+					cout << "read2" << endl;
+					int result = readSocket(&receivedPkt, servAlive->sockfd );
 
 					while (receivedPkt.type == MENSAGEM_ITEM_LISTA_DE_ARQUIVOS && result > 0)
 					{
 						cout << receivedPkt._payload;
-						//cout << "read3" << endl;
-						result = readSocket(&receivedPkt, sockfd);
+						cout << "read3" << endl;
+						result = readSocket(&receivedPkt, servAlive->sockfd );
 					}
 					cout << "listing ended" << endl;
 				}
-				else if (command.find("upload ") != std::string::npos)
+				else if (command.find("upload ") == 0)
 				{
 					cout << "uploading file" << endl;
-					std::string path = command.substr(command.find("upload ") + 7);
+					string path = command.substr(command.find("upload ") + 7);
 					cout << "file path: " << path << endl;
-					//cout << path << "\n";
-					upload_to_server(sockfd, username, path, false);
+					cout << path << "\n";
+					cout << "write112" << endl;
+					mtx_file_manipulation.lock();
+					upload_to_server(servAlive->sockfd , path);
+					mtx_file_manipulation.unlock();
 					cout << "file uploaded" << endl;
 				}
-				else if (command == ("get_sync_dir") && !sync_dir_active)
+				else if (command == "get_sync_dir" && !sync_dir_active)
 				{
 					sync_dir_active = true;
 
@@ -151,50 +152,21 @@ int main(int argc, char *argv[])
 					mtx_file_manipulation.unlock();
 
 					// cria novo socket para lidar com as atualizações recebidas do servidor pelo cliente
-
-					struct sockaddr_in serv_addr;
-					struct sigaction sigIntHandler;
-
-					sigIntHandler.sa_handler = handle_ctrlc;
-					sigemptyset(&sigIntHandler.sa_mask);
-					sigIntHandler.sa_flags = 0;
-
-					verificaRecebimentoParametros(argc);
-
-					if ((sockfd_sync = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-					{
-						printf("ERROR opening socket");
-						exit(0);
+					sockfd_sync = connect_to_server(*servAlive->server_host);
+					if(sockfd_sync == -1){
+						cout << "ERROR creating sync socket" << endl;
+						command = "";
+						command_complete = false;
 					}
-
-					socketCtrl2 = sockfd_sync;
-
-					serv_addr.sin_family = AF_INET;
-					serv_addr.sin_port = htons(PORT);
-					inet_aton(servAddr.c_str(), &serv_addr.sin_addr);
-					bzero(&(serv_addr.sin_zero), 8);
-
-					if (connect(sockfd_sync, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-					{
-						printf("ERROR connecting\n");
-						exit(0);
-					}
-
-					//cout << "sockfd_sync: " << sockfd_sync << endl;
+					cout << "sockfd_sync: " << sockfd_sync << endl;
 
 					// informa o servidor que se está recebendo atualizações
-					//cout << "write3" << endl;
-					sendMessage("", 1, GET_SYNC_DIR, 1, username, sockfd_sync);
+					cout << "write3" << endl;
+					sendMessage(username, GET_SYNC_DIR, sockfd_sync);
 
 					// cria nova thread para lidar com atualizações
-					int i = pthread_create(&thr1, NULL, handle_updates, &sockfd_sync) != 0;
-					//cout << "thread created to handle_update" << endl;
-					while (i != 0)
-					{
-						i = pthread_create(&thr1, NULL, handle_updates, &sockfd_sync);
-						//cout << "ERROR creating handle_updates thread. retrying..." << endl;
-						//cout << "ERROR number: " << i << endl;
-					}
+					cout << "creating thread to handle_updates" << endl;
+					create_thread(&thr1, NULL, handle_updates, &sockfd_sync);
 
 					while (wait_for_first_sync)
 					{
@@ -202,35 +174,33 @@ int main(int argc, char *argv[])
 					}
 
 					// cria nova thread para lidar com modificações na pasta sync_dir
-					while (pthread_create(&thr3, NULL, folderchecker, (void *)&n1) != 0)
-					{
-						//cout << "ERROR creating folderchecker thread. retrying..." << endl;
-					}
+					cout << "creating folderchecker thread" << endl;
+					create_thread(&thr3, NULL, folderchecker, (void *)&n1);
 					cout << "sync_dir active" << endl;
 				}
-				else if (command.find("download ") != std::string::npos)
+				else if (command.find("download ") == 0)
 				{
-					std::string path = command.substr(command.find("download ") + 9);
+					string path = command.substr(command.find("download ") + 9);
 					cout << "downloading file" << endl;
 					cout << "file path: " << path << endl;
-					download_file_from_server(sockfd, username, path);
+					download_file_from_server(servAlive->sockfd , path);
 					cout << "file downloaded" << endl;
 				}
-				else if (command.find("delete ") != std::string::npos)
+				else if (command.find("delete ") == 0)
 				{
-					std::string path = command.substr(command.find("delete ") + 7);
+					string path = command.substr(command.find("delete ") + 7);
 					cout << "sending delete request" << endl;
 					cout << "file path: " << path << endl;
-					//cout << "write4" << endl;
-					sendMessage((char *)path.c_str(), 1, MENSAGEM_DELETAR_NO_SERVIDOR, 1, username, sockfd);
+					cout << "write4" << endl;
+					sendMessage((char *)path.c_str(), MENSAGEM_DELETAR_NO_SERVIDOR, servAlive->sockfd );
 					cout << "file deleted" << endl;
 				}
 				command = "";
 				command_complete = false;
 			}
 		}
-		//cout << "write5" << endl;
-		sendMessage("", 1, MENSAGEM_LOGOUT, 1, username, sockfd); // logout message
+		cout << "write5" << endl;
+		sendMessage("", MENSAGEM_LOGOUT, servAlive->sockfd ); // logout message
 	}
 	else
 	{
@@ -238,8 +208,80 @@ int main(int argc, char *argv[])
 	}
 
 	close(sockfd_sync);
-	close(sockfd);
+	close(servAlive->sockfd);
 	return 0;
+}
+
+void waitForReconnection()
+{
+	PACKET localPkt;
+	socklen_t clilen;
+	int sock, newsockfd, n, yes=1;
+	struct sockaddr_in serv_addr,cli_addr,cli_addr2;
+
+	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	{
+		printf("ERROR opening socket");
+		exit(0);
+	}
+
+	// if(setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(void*)&yes, sizeof(yes)) < 0){
+	// 	cout<<"setsockopt() failed: " << errno << endl; 
+	// }
+
+	// if( setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))< 0){
+	// 	cout<<"setsockopt() failed: " << errno << endl; 
+	// }
+	
+	cli_addr.sin_family = AF_INET;
+	cli_addr.sin_port = htons(2000);
+	inet_aton(servAlive->server_host->h_name, &cli_addr.sin_addr);
+	bzero(&(cli_addr.sin_zero), 8);
+
+	if (bind(sock,(struct sockaddr *)&cli_addr, sizeof(cli_addr)) < 0)
+	{
+		printf(" ERROR on binding - %d\n", errno);
+		exit(0);
+	}
+
+	// listen to the clients
+	n = listen(sock, 5);
+	clilen = sizeof(struct sockaddr_in);
+	cout<< "Esperando conexão"<< endl;
+
+	if ((newsockfd = accept(sock, (struct sockaddr *)&serv_addr, &clilen)) == -1) 
+		printf("ERROR on accept");
+	memset(&localPkt, 0, sizeof(localPkt));
+	cout<< "Reconectado"<< endl;
+
+	servAlive->sockfd = newsockfd;
+	connected = true;
+
+}
+
+void* verificaServer(void* arg){
+
+	PACKET* pack = (PACKET*)arg;
+	int result ;
+
+	while(true){
+		while (connected)
+		{
+			sleep(1);
+			cout << "send verificacao" << endl;
+			sendMessage("Servidor vivo?", MENSAGEM_VERIFICACAO, servAlive->sockfd); // login message
+
+			cout << "read confirmacao" << endl;
+			result = read(servAlive->sockfd, &pack, sizeof(PACKET));
+
+			if (result <= 0) { //<=
+				connected = false;
+				cout<<"change server"<<endl;
+			}
+		}
+
+		waitForReconnection();
+	}
 }
 
 void verificaRecebimentoParametros(int argc)
@@ -251,170 +293,46 @@ void verificaRecebimentoParametros(int argc)
 	}
 }
 
-int upload_to_server(int sock, char username[], std::string file_path, bool sync)
+void upload_to_server(int sock, string file_path)
 {
-	char buffer[BUFFER_SIZE];
-	PACKET pktreceived;
-
-	ifstream file;
-	file.open(file_path, ios_base::binary);
-	if (!file.is_open())
-	{
-		cout << "error opening file"
-			 << "\n"
-			 << endl;
-		return 0;
-		// mensagem erro
-	}
-	else
-	{
-		file.seekg(0, file.end);
-		uint32_t file_size = file.tellg();
-		//cout << "file_size: " << file_size << endl;
-		file.clear();
-		file.seekg(0);
-
-		uint32_t max_fragments = 0;
-		max_fragments = file_size / BUFFER_SIZE;
-
-		if (file_size % BUFFER_SIZE != 0)
-		{
-			max_fragments++;
-		}
-
-		//cout << "max_fragments: " << max_fragments << endl;
-
-		//cout << "write6" << endl;
-		sendMessage((char *)file_path.c_str(), file_size, MENSAGEM_ENVIO_NOME_ARQUIVO, max_fragments, username, sock);
-		int counter = 0;
-		for (int i = 0; i < file_size; i += ((sizeof(buffer)))) // to read file
-		{
-			memset(buffer, 0, BUFFER_SIZE);
-			file.read(buffer, sizeof(buffer));
-			if (sync)
-			{
-				//cout << "write7" << endl;
-				sendMessage(buffer, i / BUFFER_SIZE, MENSAGEM_ENVIO_PARTE_ARQUIVO_SYNC, max_fragments, username, sock);
-			}
-			else
-			{
-				//cout << "write8" << endl;
-				sendMessage(buffer, i / BUFFER_SIZE, MENSAGEM_ENVIO_PARTE_ARQUIVO, max_fragments, username, sock);
-			}
-			counter++;
-			//cout << "counter: " << counter << endl;
-			/*if(counter % 300 == 299){
-				cout << "read30" << endl;
-				readSocket(&pktreceived,sock);
-			}*/
-		}
-		file.close();
-
-		//cout << "write9" << endl;
-		sendMessage(buffer, 1, MENSAGEM_ARQUIVO_LIDO, max_fragments, username, sock);
-
-		cout << "file sent"
-			 << "\n"
-			 << endl;
-		return 1;
-	}
+	sendFile(sock, file_path);
 }
-int download_file_from_server(int sock, char username[], std::string file_path)
+
+int download_file_from_server(int sock, string file_path)
 {
 	PACKET pkt;
-	//cout << "download file from server function" << endl;
-	sendMessage((char *)file_path.c_str(), 1, MENSAGEM_DOWNLOAD_NO_SERVIDOR, 1, username, sock);
-	//cout << "read6" << endl;
+	cout << "download file from server function" << endl;
+	sendMessage((char *)file_path.c_str(), MENSAGEM_DOWNLOAD_FROM_SERVER, sock);
+
+	cout << "read download name" << endl;
 	readSocket(&pkt, sock);
-	//cout << "download payload" << endl << pkt._payload << endl;
-	if (pkt.type == MENSAGEM_FALHA_ENVIO)
-	{
+	if(pkt.type == MENSAGEM_FALHA_ENVIO){
 		cout << "file does not exist on server\n";
-		return 0;
+		return 1;
 	}
-	uint32_t remainder_file_size = pkt.file_byte_size % BUFFER_SIZE;
-	//cout << "pkt.file_byte_size: " << pkt.file_byte_size << endl;
-	string receivedFilePath;
-	receivedFilePath = string(pkt._payload);
-	receivedFilePath = receivedFilePath.substr(receivedFilePath.find_last_of("/") + 1);
-	string directory = ".";
-	directory = directory + "/" + receivedFilePath;
-	//cout << directory;
-	ofstream file_download;
+
+	string file_name = getFileName(file_path);
+	string directory = "./" + file_name;
 	mtx_file_manipulation.lock();
-	file_download.open(directory, ios_base::binary);
-	int received_fragments = 0;
-	vector<vector<char>> fragments = {};
-	memset(pkt._payload, 0, BUFFER_SIZE);
-	//cout << "read7" << endl;
-	readSocket(&pkt, sock);
-	while (pkt.type == MENSAGEM_ENVIO_PARTE_ARQUIVO)
-	{
-		char buffer[BUFFER_SIZE];
-		vector<char> bufferconvert(BUFFER_SIZE);
-
-		memset(buffer, 0, BUFFER_SIZE);
-
-		memcpy(buffer, pkt._payload, BUFFER_SIZE);
-
-		//printf("%d\n", received_fragments);
-		for (int i = 0; i < bufferconvert.size(); i++)
-		{
-			bufferconvert[i] = buffer[i];
-		}
-		fragments.push_back(bufferconvert);
-		received_fragments++;
-		//cout << "received_fragments: " << received_fragments << endl;
-
-		memset(pkt._payload, 0, BUFFER_SIZE);
-		//cout << "read77" << endl;
-		readSocket(&pkt, sock);
-	}
-	for (int i = 0; i < fragments.size(); i++)
-	{
-		for (int j = 0; j < fragments.at(i).size(); j++)
-		{
-			if (i == fragments.size() - 1)
-			{
-				if (j == remainder_file_size && remainder_file_size != 0)
-				{
-					//cout << "remainder break" << endl;
-					//cout << "remainder_file_size: " << remainder_file_size << endl;
-					break;
-				}
-			}
-			char *frag = &(fragments.at(i).at(j));
-			// printf("%x ", (unsigned char)fragments.at(i).at(j));
-			file_download.write(frag, sizeof(char));
-		}
-	}
-	latest_downloads.push_back(receivedFilePath);
-	file_download.close();
+	receiveFile(sock, directory, &pkt);
+	latest_downloads.push_back(file_name);
 	mtx_file_manipulation.unlock();
-	if (pkt.type != MENSAGEM_ARQUIVO_LIDO)
-	{
-		cout << "expected msg type: " << MENSAGEM_ARQUIVO_LIDO << endl;
-		cout << "received msg type: " << pkt.type << endl;
-		cout << "error on download_file_from_server()" << endl;
-	}
-	return 1;
+	return 0;
 }
+
 void handle_ctrlc(int s)
 {
 	PACKET Pkt;
 
 	Logout = true;
-	cout << endl
-		 << "Caught signal" << endl;
+	cout << endl << "Caught signal" << endl;
 	//cout << "write12" << endl;
-	sendMessage("", 1, MENSAGEM_LOGOUT, 1, username, socketCtrl); // logout message
+	//sendMessage("", MENSAGEM_LOGOUT, socketCtrl); // logout message
 
 	//cout << endl << Pkt._payload << endl;
 
-	close(socketCtrl);
-	close(socketCtrl2);
-
-	exit(0);
+	//close(socketCtrl);
+	//close(socketCtrl2);
 }
 
 void *handle_updates(void *arg)
@@ -431,17 +349,15 @@ void *handle_updates(void *arg)
 
 	while (true)
 	{
-		//cout << "handleUpdates function" << endl;
+		cout << "handleUpdates function" << endl;
 		readSocket(&pkt, sockfd);
-		//cout << "pkt.type: " << pkt.type << ". ";
+		cout << "pkt.type: " << pkt.type << ". ";
 		if (pkt.type == MENSAGEM_DELETAR_NOS_CLIENTES)
 		{
-			string toRemoveFilePath;
+			string file_name = getFileName(string(pkt._payload));
 
-			toRemoveFilePath = string(pkt._payload);
-			toRemoveFilePath = toRemoveFilePath.substr(toRemoveFilePath.find_last_of("/") + 1);
 			string file_path = "./";
-			file_path = file_path + "sync_dir" + "/" + toRemoveFilePath;
+			file_path = file_path + "sync_dir" + "/" + file_name;
 
 			mtx_file_manipulation.lock();
 			int result = delete_file(file_path);
@@ -455,72 +371,11 @@ void *handle_updates(void *arg)
 		}
 		if (pkt.type == MENSAGEM_ENVIO_NOME_ARQUIVO)
 		{
-			remainder_file_size = pkt.file_byte_size % BUFFER_SIZE;
-			//cout << "remainder_file_size: " << remainder_file_size << endl;
-
-			receivedFilePath = string(pkt._payload);
-			receivedFilePath = receivedFilePath.substr(receivedFilePath.find_last_of("/") + 1);
-			string directory = "./";
-			directory = directory + "sync_dir" + "/" + receivedFilePath;
+			string file_name = getFileName(string(pkt._payload));
+			string directory = "./sync_dir/" + file_name;
 			mtx_file_manipulation.lock();
-			file_client.open(directory, ios_base::binary);
-
-			//cout << directory << "\n" << endl;
-
-			fragments.clear();
-			received_fragments = 0;
-		}
-		if (pkt.type == MENSAGEM_ENVIO_PARTE_ARQUIVO)
-		{
-			char buffer[BUFFER_SIZE];
-			vector<char> bufferconvert(BUFFER_SIZE);
-
-			memset(buffer, 0, BUFFER_SIZE);
-
-			memcpy(buffer, pkt._payload, BUFFER_SIZE);
-
-			// printf("%d",received_fragments);
-
-			for (int i = 0; i < bufferconvert.size(); i++)
-			{
-				bufferconvert[i] = buffer[i];
-			}
-
-			//cout << "received_fragments: " << received_fragments;
-			//cout << ". pkt.file_byte_size: " << pkt.file_byte_size;
-			//cout << ". fragments.size(): " << fragments.size() << endl;
-			fragments.push_back(bufferconvert);
-			received_fragments++;
-
-			/*if(received_fragments % 300 == 299){
-				cout << "write13" << endl;
-				sendMessage("", 1, ACK, 1, username, sockfd);
-			}*/
-			//cout << "received_fragments: " << received_fragments << endl;
-		}
-		if (pkt.type == MENSAGEM_ARQUIVO_LIDO)
-		{
-			//cout << "escrevendo" << endl;
-			for (int i = 0; i < fragments.size(); i++)
-			{
-				for (int j = 0; j < fragments.at(i).size(); j++)
-				{
-					if (i == fragments.size() - 1)
-					{
-						if (j == remainder_file_size && remainder_file_size != 0)
-						{
-							//cout << "remainder break" << endl;
-							//cout << "remainder_file_size: " << remainder_file_size << endl;
-							break;
-						}
-					}
-					char *frag = &(fragments.at(i).at(j));
-					// printf("%x ", (unsigned char)fragments.at(i).at(j));
-					file_client.write(frag, sizeof(char));
-				}
-			}
-			latest_downloads.push_back(receivedFilePath);
-			file_client.close();
+			receiveFile(sockfd, directory, &pkt);
+			latest_downloads.push_back(file_name);
 			mtx_file_manipulation.unlock();
 		}
 		if (pkt.type == FIRST_SYNC_END && wait_for_first_sync)

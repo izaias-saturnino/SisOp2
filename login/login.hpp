@@ -14,7 +14,7 @@
 class LoginManager{
     public:
         LoginManager();
-        bool login(int socketCli, char user[]);
+        bool login(int socketCli, char nome[], sockaddr_in socketAdr);
         vector<USUARIO> listaDeUsuarios;
         void printListaUsuario();
         void Logout(char user[], int socket,char resposta[]);

@@ -101,7 +101,7 @@ void *input(void *arg)
         if(command_complete==false){
             std::getline (std::cin,command);
             command_complete = true;
-            //cout << "command: " << command << endl << endl;
+            cout << "command: " << command << endl << endl;
         }
     }
     return 0;
