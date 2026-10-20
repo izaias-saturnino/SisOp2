@@ -1,33 +1,15 @@
-# Prerequisites
-*.d
+# Build output
+build/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Runtime data created by the server and client
+server_data_*/
+sync_dir/
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
+# Editor settings
 .vscode/settings.json
+
+# Compiled files
+*.o
+*.d
+*.out
+*.exe

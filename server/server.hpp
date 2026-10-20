@@ -1,59 +1,52 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-#include <vector>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <pthread.h>
-#include <netdb.h> 
-#include <iostream>
-#include <fstream>
-#include <cmath>
-#include <atomic>
-#include "../login/login.hpp"
-#include "../dir_manager.cpp"
+#pragma once
 
-typedef struct {
-    char user[BUFFER_SIZE];
-    int socket;
-    Sockaddr_in socketAddrClient;
-}SESSION;
+#include "../common/connection.hpp"
+#include "cluster.hpp"
+#include "sessions.hpp"
+#include "storage.hpp"
 
-void verificaRecebimentoIP(int argc,char *argv[]);
+#include <cstdint>
+#include <mutex>
+#include <string>
 
-void imprimeServerError(void);
+struct ServerOptions {
+    std::string host = "127.0.0.1"; // address other servers and clients use to reach this one
+    uint16_t port = 4000;
+    std::string data_dir;           // default: server_data_<port>
+    std::string join_host;          // empty: start a new cluster
+    uint16_t join_port = 0;
+};
 
-void send_file_to_client(int sock, std::string file_path);
+// Accepts connections and serves them, one thread per connection. The first
+// message on a connection says what it is: a client login, a client's sync
+// connection, or a message from another server.
+class Server {
+public:
+    explicit Server(ServerOptions options);
+    int run();
 
-void *ThreadClient(void *arg);
+private:
+    void handle_connection(ConnectionPtr conn);
 
-void close_client_connections();
+    void serve_client(const ConnectionPtr& conn, const Message& login);
+    void serve_sync(const ConnectionPtr& conn, const Message& attach);
+    // Returns false when the session should end.
+    bool handle_request(const ConnectionPtr& conn, const std::string& user, uint64_t token,
+                        const Message& msg);
+    bool handle_list(Connection& conn, const std::string& user);
+    bool handle_upload(Connection& conn, const std::string& user, uint64_t token, const Message& msg);
+    bool handle_download(Connection& conn, const std::string& user, const Message& msg);
+    bool handle_delete(Connection& conn, const std::string& user, uint64_t token, const Message& msg);
 
-void handle_ctrlc(int s);
+    // Send a change to the user's sync connections, skipping session `except`.
+    void push_file(const std::string& user, const std::string& name, uint64_t except);
+    void push_delete(const std::string& user, const std::string& name, uint64_t except);
+    void push_server_list(const std::vector<ServerAddress>& servers);
+    void send_redirect(Connection& conn);
 
-void* check_main_server_up(void *arg);
-
-void insert_in_server_list(SERVER_COPY server_copy);
-
-int get_new_id(vector<SERVER_COPY> servers);
-
-void *answer_server_up(void *arg);
-
-void send_list_of_servers(int other_server_socket);
-void receive_list_of_servers(int other_server_socket);
-SERVER_COPY get_main_server_copy();
-int connect_to_main_server();
-
-bool has_biggest_id(SERVER_COPY server_copy);
-void broadcast_new_server(SERVER_COPY server_copy, int msg_type);
-void *send_election(void *arg);
-void send_election();
-void send_election(vector<SERVER_COPY> servers);
-int host_cmp(char* ip, char* other_ip);
-void* share_server_list(void *arg);
-void* timer(void *arg);
-void* connection_timer(void *arg);
-vector<int> clear_connections(vector<int> connections);
-bool compare_id(SERVER_COPY copy1, SERVER_COPY copy2);
+    ServerOptions options_;
+    Storage storage_;
+    std::mutex write_mutex_; // serializes changes to storage and their replication
+    SessionManager sessions_;
+    Cluster cluster_;
+};
