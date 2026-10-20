@@ -1,0 +1,3 @@
+# Linux-only project: keep LF line endings even in Windows checkouts,
+# so the scripts and Makefile work from WSL.
+* text=auto eol=lf
