@@ -1,6 +1,27 @@
 #include "sessions.hpp"
 
-uint64_t SessionManager::open(const std::string& user, ConnectionPtr command)
+#include <openssl/rand.h>
+
+namespace {
+
+std::string random_token()
+{
+    unsigned char bytes[16];
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        return "";
+    }
+    static const char digits[] = "0123456789abcdef";
+    std::string token;
+    for (unsigned char b : bytes) {
+        token += digits[b >> 4];
+        token += digits[b & 0xF];
+    }
+    return token;
+}
+
+} // namespace
+
+std::string SessionManager::open(const std::string& user, ConnectionPtr command)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;
@@ -10,17 +31,17 @@ uint64_t SessionManager::open(const std::string& user, ConnectionPtr command)
         }
     }
     if (count >= MAX_SESSIONS_PER_USER) {
-        return 0;
+        return "";
     }
-    uint64_t token = 0;
-    while (token == 0 || sessions_.count(token) > 0) {
-        token = rng_();
+    std::string token = random_token();
+    if (token.empty() || sessions_.count(token) > 0) {
+        return "";
     }
     sessions_[token] = Session{user, std::move(command), nullptr};
     return token;
 }
 
-void SessionManager::close(uint64_t token)
+void SessionManager::close(const std::string& token)
 {
     Session session;
     {
@@ -38,7 +59,7 @@ void SessionManager::close(uint64_t token)
     }
 }
 
-bool SessionManager::attach_sync(uint64_t token, ConnectionPtr sync)
+bool SessionManager::attach_sync(const std::string& token, ConnectionPtr sync)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(token);
@@ -49,7 +70,7 @@ bool SessionManager::attach_sync(uint64_t token, ConnectionPtr sync)
     return true;
 }
 
-void SessionManager::detach_sync(uint64_t token, const ConnectionPtr& sync)
+void SessionManager::detach_sync(const std::string& token, const ConnectionPtr& sync)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(token);
@@ -58,7 +79,8 @@ void SessionManager::detach_sync(uint64_t token, const ConnectionPtr& sync)
     }
 }
 
-std::vector<ConnectionPtr> SessionManager::sync_connections(const std::string& user, uint64_t except)
+std::vector<ConnectionPtr> SessionManager::sync_connections(const std::string& user,
+                                                            const std::string& except)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<ConnectionPtr> result;

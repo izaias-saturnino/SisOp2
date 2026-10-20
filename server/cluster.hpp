@@ -2,6 +2,7 @@
 
 #include "../common/connection.hpp"
 #include "../common/protocol.hpp"
+#include "accounts.hpp"
 #include "storage.hpp"
 
 #include <atomic>
@@ -48,7 +49,8 @@ class Cluster {
 public:
     using MembershipListener = std::function<void(const std::vector<ServerAddress>&)>;
 
-    Cluster(std::string host, uint16_t port, Storage& storage, std::mutex& write_mutex);
+    Cluster(std::string host, uint16_t port, Storage& storage, Accounts& accounts,
+            std::mutex& write_mutex);
     ~Cluster();
 
     void set_membership_listener(MembershipListener listener);
@@ -72,6 +74,7 @@ public:
     // changes in the same order as the primary.
     void replicate_put(const std::string& user, const std::string& name);
     void replicate_delete(const std::string& user, const std::string& name);
+    void replicate_account(const std::string& user, const std::string& record);
 
 private:
     enum class Role { Joining, Backup, Primary };
@@ -88,6 +91,7 @@ private:
     bool attach_replica(const ServerAddress& member);
     bool put_on_link(Link& link, const std::string& user, const std::string& name);
     bool delete_on_link(Link& link, const std::string& user, const std::string& name);
+    bool account_on_link(Link& link, const std::string& user, const std::string& record);
     void drop_link(uint32_t id, const std::string& reason);
     void broadcast_membership();
     std::vector<LinkPtr> links_snapshot();
@@ -109,6 +113,7 @@ private:
     void remove_member(uint32_t id);
 
     Storage& storage_;
+    Accounts& accounts_;
     std::mutex& write_mutex_;
 
     mutable std::mutex mutex_;

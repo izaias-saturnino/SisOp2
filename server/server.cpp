@@ -2,21 +2,30 @@
 
 #include "../common/log.hpp"
 #include "../common/net.hpp"
+#include "../common/tls.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <thread>
 
 namespace {
 
+constexpr int HANDSHAKE_TIMEOUT_MS = 10000;
 constexpr int FIRST_MESSAGE_TIMEOUT_MS = 10000;
 // Clients ping every second; this much silence means the client is gone.
 constexpr int CLIENT_IDLE_TIMEOUT_MS = 30000;
+// Slows down password guessing.
+constexpr auto WRONG_PASSWORD_DELAY = std::chrono::seconds(1);
 
-std::string short_token(uint64_t token)
+std::string short_token(const std::string& token)
 {
-    char text[8];
-    std::snprintf(text, sizeof(text), "%04llx", static_cast<unsigned long long>(token & 0xFFFF));
-    return text;
+    return token.substr(0, 4);
+}
+
+bool is_cluster_message(Msg type)
+{
+    return type == Msg::Join || type == Msg::Election || type == Msg::Coordinator ||
+           type == Msg::ReplicaAttach;
 }
 
 } // namespace
@@ -25,13 +34,23 @@ Server::Server(ServerOptions options)
     : options_(std::move(options)),
       storage_(options_.data_dir.empty() ? "server_data_" + std::to_string(options_.port)
                                          : options_.data_dir),
-      cluster_(options_.host, options_.port, storage_, write_mutex_)
+      accounts_(storage_.accounts_dir()),
+      cluster_(options_.host, options_.port, storage_, accounts_, write_mutex_)
 {
 }
 
 int Server::run()
 {
-    if (!storage_.init()) {
+    TlsConfig tls;
+    tls.ca_file = join_path(options_.certs_dir, "ca.pem");
+    tls.cert_file = join_path(options_.certs_dir, "server.pem");
+    tls.key_file = join_path(options_.certs_dir, "server.key");
+    std::string error;
+    if (!tls_init(tls, error)) {
+        LOG_ERROR(error << " (create the certificates with tools/make-certs.sh)");
+        return 1;
+    }
+    if (!storage_.init() || !accounts_.init()) {
         LOG_ERROR("could not create the data directory " << storage_.root());
         return 1;
     }
@@ -56,19 +75,29 @@ int Server::run()
     LOG_INFO("listening on port " << options_.port << ", data in " << storage_.root());
 
     while (true) {
-        ConnectionPtr conn = accept_from(listen_fd);
-        if (!conn) {
+        std::string peer;
+        int fd = accept_socket(listen_fd, peer);
+        if (fd < 0) {
             LOG_ERROR("accept failed: " << std::strerror(errno));
             return 1;
         }
-        std::thread(&Server::handle_connection, this, conn).detach();
+        std::thread(&Server::handle_connection, this, fd, peer).detach();
     }
 }
 
-void Server::handle_connection(ConnectionPtr conn)
+void Server::handle_connection(int fd, std::string peer)
 {
+    ConnectionPtr conn = tls_accept(fd, peer, HANDSHAKE_TIMEOUT_MS);
+    if (!conn) {
+        return;
+    }
     Message first;
     if (conn->recv(first, FIRST_MESSAGE_TIMEOUT_MS) != RecvStatus::Ok) {
+        return;
+    }
+    if (is_cluster_message(first.type) && !conn->peer_is_server()) {
+        LOG_WARN(conn->peer() << " sent " << msg_name(first.type) << " without a server certificate");
+        send_error(*conn, "a server certificate is required");
         return;
     }
     try {
@@ -102,10 +131,45 @@ void Server::send_redirect(Connection& conn)
 
 // ---------------------------------------------------------------- client side
 
+// Checks the password, creating the account on the user's first login.
+// Replies with an Error and returns false if the login must be refused.
+bool Server::authenticate(Connection& conn, const std::string& user, const std::string& password)
+{
+    std::string record;
+    if (!accounts_.get(user, record)) {
+        std::string new_record = Accounts::make_record(password);
+        bool created = false;
+        if (!new_record.empty()) {
+            std::lock_guard<std::mutex> write(write_mutex_);
+            created = accounts_.create(user, new_record);
+            if (created) {
+                cluster_.replicate_account(user, new_record);
+            }
+        }
+        if (created) {
+            LOG_INFO("created the account " << user);
+            return true;
+        }
+        // Someone else created it at the same moment: check against theirs.
+        if (!accounts_.get(user, record)) {
+            send_error(conn, "the server could not create the account");
+            return false;
+        }
+    }
+    if (Accounts::verify(record, password)) {
+        return true;
+    }
+    LOG_WARN("wrong password for " << user << " from " << conn.peer());
+    std::this_thread::sleep_for(WRONG_PASSWORD_DELAY);
+    send_error(conn, "wrong password");
+    return false;
+}
+
 void Server::serve_client(const ConnectionPtr& conn, const Message& login)
 {
     Reader r(login.payload);
     std::string user = r.str();
+    std::string password = r.str();
 
     if (!cluster_.is_primary()) {
         send_redirect(*conn);
@@ -115,12 +179,20 @@ void Server::serve_client(const ConnectionPtr& conn, const Message& login)
         send_error(*conn, "invalid username (use letters, digits, '_' or '-', up to 32 characters)");
         return;
     }
+    if (password.size() < Accounts::MIN_PASSWORD_LENGTH || password.size() > Accounts::MAX_PASSWORD_LENGTH) {
+        send_error(*conn, "passwords must have between " + std::to_string(Accounts::MIN_PASSWORD_LENGTH) +
+                              " and " + std::to_string(Accounts::MAX_PASSWORD_LENGTH) + " characters");
+        return;
+    }
+    if (!authenticate(*conn, user, password)) {
+        return;
+    }
     if (!storage_.ensure_user(user)) {
         send_error(*conn, "the server could not create the user's directory");
         return;
     }
-    uint64_t token = sessions_.open(user, conn);
-    if (token == 0) {
+    std::string token = sessions_.open(user, conn);
+    if (token.empty()) {
         send_error(*conn, "this user already has " +
                               std::to_string(SessionManager::MAX_SESSIONS_PER_USER) +
                               " active sessions");
@@ -128,7 +200,7 @@ void Server::serve_client(const ConnectionPtr& conn, const Message& login)
     }
 
     Writer w;
-    w.u64(token);
+    w.str(token);
     write_servers(w, cluster_.members());
     if (conn->send(Msg::LoginOk, w.data())) {
         LOG_INFO(user << " logged in from " << conn->peer() << " (session " << short_token(token) << ")");
@@ -158,8 +230,8 @@ void Server::serve_client(const ConnectionPtr& conn, const Message& login)
     sessions_.close(token);
 }
 
-bool Server::handle_request(const ConnectionPtr& conn, const std::string& user, uint64_t token,
-                            const Message& msg)
+bool Server::handle_request(const ConnectionPtr& conn, const std::string& user,
+                            const std::string& token, const Message& msg)
 {
     switch (msg.type) {
     case Msg::Ping:
@@ -184,7 +256,7 @@ bool Server::handle_request(const ConnectionPtr& conn, const std::string& user, 
 
 bool Server::handle_list(Connection& conn, const std::string& user)
 {
-    std::vector<FileInfo> files = storage_.list(user, true);
+    std::vector<FileInfo> files = storage_.list(user);
     Writer w;
     w.u32(static_cast<uint32_t>(files.size()));
     for (const FileInfo& file : files) {
@@ -196,7 +268,7 @@ bool Server::handle_list(Connection& conn, const std::string& user)
     return conn.send(Msg::FileList, w.data());
 }
 
-bool Server::handle_upload(Connection& conn, const std::string& user, uint64_t token,
+bool Server::handle_upload(Connection& conn, const std::string& user, const std::string& token,
                            const Message& msg)
 {
     Reader r(msg.payload);
@@ -212,7 +284,7 @@ bool Server::handle_upload(Connection& conn, const std::string& user, uint64_t t
     if (result != TransferResult::Ok) {
         return send_error(conn, "the upload was not completed");
     }
-    if (!is_valid_file_name(info.name)) {
+    if (!is_valid_path(info.name)) {
         remove_file(temp);
         return send_error(conn, "invalid file name");
     }
@@ -227,57 +299,58 @@ bool Server::handle_upload(Connection& conn, const std::string& user, uint64_t t
     }
     if (!stored) {
         remove_file(temp);
-        return send_error(conn, "the server could not store the file");
+        return send_error(conn, "the server could not store " + info.name +
+                                    " (a file and a folder can't have the same name)");
     }
     LOG_INFO("stored " << user << "/" << info.name << " (" << format_size(info.size) << ")");
     if (!conn.send(Msg::Ok)) {
         return false;
     }
     // A change made in this session's own sync_dir doesn't go back to it.
-    push_file(user, info.name, origin == Origin::Sync ? token : 0);
+    push_file(user, info.name, origin == Origin::Sync ? token : "");
     return true;
 }
 
 bool Server::handle_download(Connection& conn, const std::string& user, const Message& msg)
 {
     Reader r(msg.payload);
-    std::string name = r.str();
-    if (!is_valid_file_name(name)) {
+    std::string path = r.str();
+    if (!is_valid_path(path)) {
         return send_error(conn, "invalid file name");
     }
-    TransferResult result = send_file(conn, Msg::File, "", name, storage_.file_path(user, name));
+    TransferResult result = send_file(conn, Msg::File, "", path, storage_.file_path(user, path));
     if (result == TransferResult::NotSent) {
         return send_error(conn, "no such file on the server");
     }
     return result != TransferResult::ConnectionLost;
 }
 
-bool Server::handle_delete(Connection& conn, const std::string& user, uint64_t token,
+bool Server::handle_delete(Connection& conn, const std::string& user, const std::string& token,
                            const Message& msg)
 {
     Reader r(msg.payload);
     Origin origin = static_cast<Origin>(r.u8());
-    std::string name = r.str();
-    if (!is_valid_file_name(name)) {
+    std::string path = r.str();
+    if (!is_valid_path(path)) {
         return send_error(conn, "invalid file name");
     }
 
     bool existed;
     {
         std::lock_guard<std::mutex> write(write_mutex_);
-        existed = storage_.remove(user, name);
+        existed = storage_.remove(user, path);
         if (existed) {
-            cluster_.replicate_delete(user, name);
+            cluster_.replicate_delete(user, path);
         }
     }
     if (!existed) {
         return send_error(conn, "no such file on the server");
     }
-    LOG_INFO("deleted " << user << "/" << name);
+    LOG_INFO("deleted " << user << "/" << path);
     if (!conn.send(Msg::Ok)) {
         return false;
     }
-    push_delete(user, name, origin == Origin::Sync ? token : 0);
+    push_delete(user, path, origin == Origin::Sync ? token : "");
     return true;
 }
 
@@ -286,7 +359,7 @@ bool Server::handle_delete(Connection& conn, const std::string& user, uint64_t t
 void Server::serve_sync(const ConnectionPtr& conn, const Message& attach)
 {
     Reader r(attach.payload);
-    uint64_t token = r.u64();
+    std::string token = r.str();
     {
         // Hold the send lock so no push can get ahead of the Ok.
         auto lock = conn->lock_send();
@@ -306,20 +379,20 @@ void Server::serve_sync(const ConnectionPtr& conn, const Message& attach)
     sessions_.detach_sync(token, conn);
 }
 
-void Server::push_file(const std::string& user, const std::string& name, uint64_t except)
+void Server::push_file(const std::string& user, const std::string& path, const std::string& except)
 {
-    std::string path = storage_.file_path(user, name);
+    std::string full_path = storage_.file_path(user, path);
     for (const ConnectionPtr& sync : sessions_.sync_connections(user, except)) {
-        if (send_file(*sync, Msg::PushFile, "", name, path) == TransferResult::ConnectionLost) {
+        if (send_file(*sync, Msg::PushFile, "", path, full_path) == TransferResult::ConnectionLost) {
             sync->shutdown();
         }
     }
 }
 
-void Server::push_delete(const std::string& user, const std::string& name, uint64_t except)
+void Server::push_delete(const std::string& user, const std::string& path, const std::string& except)
 {
     Writer w;
-    w.str(name);
+    w.str(path);
     for (const ConnectionPtr& sync : sessions_.sync_connections(user, except)) {
         if (!sync->send(Msg::PushDelete, w.data())) {
             sync->shutdown();

@@ -42,11 +42,11 @@ std::string file_table(const std::vector<FileInfo>& files)
         return "  (no files)";
     }
     std::string table;
-    char line[512];
-    std::snprintf(line, sizeof(line), "  %-40s %10s  %s", "NAME", "SIZE", "MODIFIED");
+    char line[MAX_PATH_LENGTH + 128];
+    std::snprintf(line, sizeof(line), "  %-48s %10s  %s", "PATH", "SIZE", "MODIFIED");
     table += line;
     for (const FileInfo& file : files) {
-        std::snprintf(line, sizeof(line), "\n  %-40s %10s  %s", file.name.c_str(),
+        std::snprintf(line, sizeof(line), "\n  %-48s %10s  %s", file.name.c_str(),
                       format_size(file.size).c_str(), format_time(file.mtime_ns).c_str());
         table += line;
     }
@@ -56,13 +56,13 @@ std::string file_table(const std::vector<FileInfo>& files)
 const char* const HELP =
     "Commands:\n"
     "  upload <path>     send a file to the server; it then shows up in every synced sync_dir\n"
-    "  download <file>   copy a file from the server into the current directory\n"
-    "  delete <file>     delete a file from the server and from every synced sync_dir\n"
+    "  download <path>   copy a file from the server into the current directory\n"
+    "  delete <path>     delete a file from the server and from every synced sync_dir\n"
     "  list_server       list your files on the server\n"
     "  list_client       list the files in your sync_dir\n"
     "  sync              compare sync_dir with the server again (get_sync_dir also works)\n"
     "  exit              log out and quit\n"
-    "Files you add, change or delete in sync_dir are synced automatically.";
+    "Files you add, change or delete in sync_dir (subfolders included) are synced automatically.";
 
 } // namespace
 
@@ -145,7 +145,7 @@ Client::ConnectResult Client::connect_once()
             continue;
         }
         Writer login;
-        login.str(options_.user);
+        login.str(options_.user).str(options_.password);
         Message reply;
         CallResult login_result = call(*cmd, Msg::Login, login.data(), Msg::LoginOk, reply, LOGIN_TIMEOUT_MS);
         if (login_result == CallResult::Failed) {
@@ -169,12 +169,12 @@ Client::ConnectResult Client::connect_once()
             }
 
             Reader r(reply.payload);
-            uint64_t token = r.u64();
+            std::string token = r.str();
             std::vector<ServerAddress> servers = read_servers(r);
 
             ConnectionPtr sync = connect_to(host, port, CONNECT_TIMEOUT_MS);
             Writer attach;
-            attach.u64(token);
+            attach.str(token);
             Message ack;
             if (!sync || call(*sync, Msg::SyncAttach, attach.data(), Msg::Ok, ack, LOGIN_TIMEOUT_MS) !=
                              CallResult::Ok) {
@@ -468,12 +468,14 @@ bool Client::reconcile(bool report)
     std::map<std::string, FileInfo> local;
     std::map<std::string, FileInfo> remote;
     std::set<std::string> names;
-    for (const FileInfo& file : list_dir(options_.sync_dir, true)) {
-        local[file.name] = file;
-        names.insert(file.name);
+    for (FileInfo file : list_tree(options_.sync_dir)) {
+        if (fill_hash(file)) {
+            local[file.name] = file;
+            names.insert(file.name);
+        }
     }
     for (const FileInfo& file : remote_files) {
-        if (is_valid_file_name(file.name)) {
+        if (is_valid_path(file.name)) {
             remote[file.name] = file;
             names.insert(file.name);
         }
@@ -535,6 +537,7 @@ bool Client::reconcile(bool report)
             }
         } else {
             remove_file(path);
+            remove_empty_parents(options_.sync_dir, name);
             state_.erase(name);
             ++deleted_here;
         }
@@ -557,16 +560,38 @@ bool Client::reconcile(bool report)
     return true;
 }
 
-// A name for keeping a local version that would otherwise be overwritten:
-// "notes (conflicted copy 2026-10-20 14.03.07).txt".
+// Caller holds sync_mutex_. Fills in the content hash of a local file, reusing
+// the saved one when size and modification time haven't changed since the
+// last sync (like git's index), so unchanged files aren't read again.
+bool Client::fill_hash(FileInfo& file)
+{
+    FileInfo base;
+    if (state_.get(file.name, base) && base.size == file.size && base.mtime_ns == file.mtime_ns) {
+        file.hash = base.hash;
+        return true;
+    }
+    return hash_file(join_path(options_.sync_dir, file.name), file.hash);
+}
+
+// Caller holds sync_mutex_. False if `name` isn't a regular file in sync_dir.
+bool Client::local_file(const std::string& name, FileInfo& info)
+{
+    info.name = name;
+    return stat_file(join_path(options_.sync_dir, name), info, false) && fill_hash(info);
+}
+
+// A path for keeping a local version that would otherwise be overwritten:
+// "docs/notes (conflicted copy 2026-10-20 14.03.07).txt".
 std::string Client::conflict_name(const std::string& name) const
 {
-    std::size_t dot = name.rfind('.');
+    std::string dir = parent_path(name);
+    std::string file = base_name(name);
+    std::size_t dot = file.rfind('.');
     if (dot == 0 || dot == std::string::npos) {
-        dot = name.size();
+        dot = file.size();
     }
-    std::string stem = name.substr(0, dot);
-    std::string extension = name.substr(dot);
+    std::string stem = file.substr(0, dot);
+    std::string extension = file.substr(dot);
 
     std::time_t now = std::time(nullptr);
     std::tm local{};
@@ -579,6 +604,9 @@ std::string Client::conflict_name(const std::string& name) const
                           (attempt > 1 ? " " + std::to_string(attempt) : "") + ")";
         std::size_t room = MAX_NAME_LENGTH - tag.size() - std::min(extension.size(), std::size_t(32));
         std::string candidate = stem.substr(0, room) + tag + extension.substr(0, 32);
+        if (!dir.empty()) {
+            candidate = dir + "/" + candidate;
+        }
         FileInfo ignored;
         if (!stat_file(join_path(options_.sync_dir, candidate), ignored, false)) {
             return candidate;
@@ -595,7 +623,7 @@ void Client::install(const std::string& temp, const std::string& name, const Fil
     std::string path = join_path(options_.sync_dir, name);
     FileInfo current;
     FileInfo base;
-    if (stat_file(path, current, true) && !same_content(current, info) &&
+    if (local_file(name, current) && !same_content(current, info) &&
         !(state_.get(name, base) && same_content(base, current))) {
         std::string copy = conflict_name(name);
         if (replace_file(path, join_path(options_.sync_dir, copy))) {
@@ -610,10 +638,10 @@ void Client::install(const std::string& temp, const std::string& name, const Fil
     // Record it before the rename, so the watcher event the rename causes is
     // recognized as already in sync instead of being uploaded back.
     state_.set(entry);
-    if (!replace_file(temp, path)) {
+    if (!make_parent_dirs(options_.sync_dir, name) || !replace_file(temp, path)) {
         remove_file(temp);
         state_.erase(name);
-        say("Could not write " + path);
+        say("Could not write " + path + " (a file and a folder can't have the same name)");
     }
     state_.save();
 }
@@ -623,7 +651,7 @@ void Client::sync_local_change(const std::string& name)
     std::lock_guard<std::mutex> lock(sync_mutex_);
     std::string path = join_path(options_.sync_dir, name);
     FileInfo here;
-    bool exists = stat_file(path, here, true);
+    bool exists = local_file(name, here);
     FileInfo base;
     bool has_base = state_.get(name, base);
 
@@ -669,7 +697,7 @@ bool Client::handle_push(Connection& sync, const Message& msg)
             if (received == TransferResult::ConnectionLost) {
                 return false;
             }
-            if (received != TransferResult::Ok || !is_valid_file_name(info.name)) {
+            if (received != TransferResult::Ok || !is_valid_path(info.name)) {
                 remove_file(temp);
                 return true;
             }
@@ -683,11 +711,12 @@ bool Client::handle_push(Connection& sync, const Message& msg)
         case Msg::PushDelete: {
             Reader r(msg.payload);
             std::string name = r.str();
-            if (is_valid_file_name(name)) {
+            if (is_valid_path(name)) {
                 std::lock_guard<std::mutex> lock(sync_mutex_);
                 state_.erase(name);
                 state_.save();
                 if (remove_file(join_path(options_.sync_dir, name))) {
+                    remove_empty_parents(options_.sync_dir, name);
                     say("[sync] " + name + " was deleted on the server");
                 }
             }
@@ -742,10 +771,31 @@ void Client::worker_loop()
             continue;
         }
         if (name.empty()) {
-            reconcile(true); // the watcher lost events
+            rescan_local();
         } else {
             sync_local_change(name);
         }
+    }
+}
+
+// Checks every file against the saved state. Used when a whole folder was
+// created, moved or deleted (inotify reports only the folder, not its
+// contents) and when the watcher lost events. Unchanged files only cost a
+// stat, thanks to fill_hash.
+void Client::rescan_local()
+{
+    std::set<std::string> names;
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        for (const FileInfo& file : list_tree(options_.sync_dir)) {
+            names.insert(file.name);
+        }
+        for (const std::string& name : state_.names()) {
+            names.insert(name);
+        }
+    }
+    for (const std::string& name : names) {
+        sync_local_change(name);
     }
 }
 
@@ -795,7 +845,7 @@ bool Client::run_command(const std::string& line)
 
 void Client::cmd_upload(const std::string& path)
 {
-    std::string name = path.substr(path.rfind('/') + 1);
+    std::string name = base_name(path);
     if (path.empty() || !is_valid_file_name(name)) {
         say("Usage: upload <path to a file>");
         return;
@@ -815,8 +865,8 @@ void Client::cmd_upload(const std::string& path)
 
 void Client::cmd_download(const std::string& name)
 {
-    if (!is_valid_file_name(name)) {
-        say("Usage: download <file name>");
+    if (!is_valid_path(name)) {
+        say("Usage: download <file path, as shown by list_server>");
         return;
     }
     FileInfo got;
@@ -827,18 +877,19 @@ void Client::cmd_download(const std::string& name)
         return;
     }
     set_mtime(temp, got.mtime_ns);
-    if (replace_file(temp, name)) {
-        say("Downloaded " + name + " (" + format_size(got.size) + ") to ./" + name);
+    std::string local = base_name(name);
+    if (replace_file(temp, local)) {
+        say("Downloaded " + name + " (" + format_size(got.size) + ") to ./" + local);
     } else {
         remove_file(temp);
-        say("Could not write ./" + name);
+        say("Could not write ./" + local);
     }
 }
 
 void Client::cmd_delete(const std::string& name)
 {
-    if (!is_valid_file_name(name)) {
-        say("Usage: delete <file name>");
+    if (!is_valid_path(name)) {
+        say("Usage: delete <file path, as shown by list_server>");
         return;
     }
     std::string error;
@@ -862,7 +913,7 @@ void Client::cmd_list_server()
 
 void Client::cmd_list_client()
 {
-    say("Files in " + options_.sync_dir + ":\n" + file_table(list_dir(options_.sync_dir, false)));
+    say("Files in " + options_.sync_dir + ":\n" + file_table(list_tree(options_.sync_dir)));
 }
 
 void Client::cmd_sync()

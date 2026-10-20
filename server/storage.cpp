@@ -37,9 +37,14 @@ std::string Storage::user_dir(const std::string& user) const
     return join_path(users_dir_, user);
 }
 
-std::string Storage::file_path(const std::string& user, const std::string& name) const
+std::string Storage::file_path(const std::string& user, const std::string& path) const
 {
-    return join_path(user_dir(user), name);
+    return join_path(user_dir(user), path);
+}
+
+std::string Storage::accounts_dir() const
+{
+    return join_path(root_, "accounts");
 }
 
 bool Storage::ensure_user(const std::string& user)
@@ -64,22 +69,53 @@ std::vector<std::string> Storage::users() const
     return users;
 }
 
-std::vector<FileInfo> Storage::list(const std::string& user, bool with_hash) const
+std::vector<FileInfo> Storage::list(const std::string& user) const
 {
-    return list_dir(user_dir(user), with_hash);
+    std::vector<FileInfo> files = list_tree(user_dir(user));
+    std::vector<FileInfo> hashed;
+    for (FileInfo& file : files) {
+        std::string path = file_path(user, file.name);
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = hash_cache_.find(path);
+            if (it != hash_cache_.end() && it->second.size == file.size &&
+                it->second.mtime_ns == file.mtime_ns) {
+                file.hash = it->second.hash;
+                hashed.push_back(file);
+                continue;
+            }
+        }
+        if (hash_file(path, file.hash)) { // skip files that vanished meanwhile
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            hash_cache_[path] = file;
+            hashed.push_back(file);
+        }
+    }
+    return hashed;
 }
 
-bool Storage::commit(const std::string& user, const std::string& name, const std::string& temp,
+bool Storage::commit(const std::string& user, const std::string& path, const std::string& temp,
                      int64_t mtime_ns)
 {
-    if (!ensure_user(user)) {
+    if (!ensure_user(user) || !make_parent_dirs(user_dir(user), path)) {
         return false;
     }
     set_mtime(temp, mtime_ns);
-    return replace_file(temp, file_path(user, name));
+    {
+        // The new contents may keep the old size and mtime; don't trust the cache.
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        hash_cache_.erase(file_path(user, path));
+    }
+    return replace_file(temp, file_path(user, path));
 }
 
-bool Storage::remove(const std::string& user, const std::string& name)
+bool Storage::remove(const std::string& user, const std::string& path)
 {
-    return remove_file(file_path(user, name));
+    if (!remove_file(file_path(user, path))) {
+        return false;
+    }
+    remove_empty_parents(user_dir(user), path);
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    hash_cache_.erase(file_path(user, path));
+    return true;
 }

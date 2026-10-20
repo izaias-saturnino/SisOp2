@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end tests: starts real servers and clients on localhost and checks
-# that files end up where they should. Linux only (WSL works).
+# that files end up where they should. Linux only (WSL works); needs openssl.
 #
 #   tests/integration.sh          run everything
 #   KEEP=1 tests/integration.sh   keep the work directory (logs, data) afterwards
 #
-# Clients read their commands from a FIFO, so tests can type into them.
+# Clients read their password and then their commands from a FIFO, so tests
+# can type into them.
 
 set -u
 
@@ -16,7 +17,9 @@ CLIENT="$ROOT/build/client"
 
 WORK=$(mktemp -d /tmp/sisop-test.XXXXXX)
 BASE_PORT=${BASE_PORT:-$((20000 + RANDOM % 20000))}
-P1=$BASE_PORT P2=$((BASE_PORT + 1)) P3=$((BASE_PORT + 2)) P4=$((BASE_PORT + 3))
+P1=$BASE_PORT P2=$((BASE_PORT + 1)) P3=$((BASE_PORT + 2)) P4=$((BASE_PORT + 3)) P5=$((BASE_PORT + 4))
+CERTS=$WORK/certs
+"$ROOT/tools/make-certs.sh" "$CERTS" >/dev/null || exit 1
 
 PASS=0
 FAIL=0
@@ -77,24 +80,31 @@ start_server() {
     shift 2
     mkdir -p "$WORK/$name"
     rotate_log "$WORK/$name/server.log"
-    (cd "$WORK/$name" && exec "$SERVER" --port "$port" --data data "$@" >>server.log 2>&1) &
+    (cd "$WORK/$name" && exec "$SERVER" --port "$port" --data data --certs "$CERTS" "$@" >>server.log 2>&1) &
     PIDS[$name]=$!
     wait_for 15 logged "$WORK/$name/server.log" "listening on port $port"
 }
 
-# start_client NAME USER PORT: the client runs in $WORK/NAME with ./sync_dir.
+# start_client NAME USER PORT [PASSWORD]: runs in $WORK/NAME with ./sync_dir.
 start_client() {
-    local name=$1 user=$2 port=$3
+    local name=$1 user=$2 port=$3 password=${4:-$2-pass1}
     mkdir -p "$WORK/$name"
     rotate_log "$WORK/$name/client.log"
     rm -f "$WORK/$name/in"
     mkfifo "$WORK/$name/in"
-    (cd "$WORK/$name" && exec "$CLIENT" "$user" 127.0.0.1 "$port" <in >>client.log 2>&1) &
+    (cd "$WORK/$name" && exec "$CLIENT" "$user" 127.0.0.1 "$port" --ca "$CERTS/ca.pem" <in >>client.log 2>&1) &
     PIDS[$name]=$!
     local fd
     exec {fd}>"$WORK/$name/in"
     FDS[$name]=$fd
+    echo "$password" >&"$fd"
     wait_for 10 logged "$WORK/$name/client.log" "Connected to"
+}
+
+# one_shot_client NAME USER PORT PASSWORD: logs in and quits right away.
+one_shot_client() {
+    mkdir -p "$WORK/$1"
+    (cd "$WORK/$1" && printf '%s\n' "$4" | timeout 15 "$CLIENT" "$2" 127.0.0.1 "$3" --ca "$CERTS/ca.pem" >client.log 2>&1)
 }
 
 type_in() { echo "$2" >&"${FDS[$1]}"; }           # type_in CLIENT COMMAND
@@ -114,8 +124,8 @@ S1=$WORK/s1/data/users/alice
 # -------------------------------------------------------------------- tests
 
 echo "== basic sync between two sessions"
-start_server s1 "$P1" || { echo "server did not start"; exit 1; }
-start_client a alice "$P1"
+start_server s1 "$P1" || { echo "server did not start"; cat "$WORK/s1/server.log"; exit 1; }
+start_client a alice "$P1" || { echo "client did not connect"; cat "$WORK/a/client.log"; exit 1; }
 start_client b alice "$P1"
 
 echo hello >"$A/hello.txt"
@@ -138,9 +148,25 @@ echo spaced >"$A/my notes.txt"
 : >"$A/empty.txt"
 check "names with spaces work" has "$B/my notes.txt" spaced
 check "empty files work" bash -c "[ -f '$B/empty.txt' ] && [ ! -s '$B/empty.txt' ]"
-mkdir "$A/subdir" && echo nested >"$A/subdir/nested.txt"
-sleep 1
-check_now "subdirectories are ignored without breaking anything" bash -c "kill -0 ${PIDS[a]} && kill -0 ${PIDS[s1]} && [ ! -e '$B/subdir' ]"
+
+echo "== subfolders"
+mkdir -p "$A/docs/notes"
+echo nested >"$A/docs/notes/n.txt"
+check "files in subfolders are synced" has "$B/docs/notes/n.txt" nested
+check "... into the same folders on the server" has "$S1/docs/notes/n.txt" nested
+echo deep >"$B/docs/notes/deep.txt"
+check "subfolder changes flow both ways" has "$A/docs/notes/deep.txt" deep
+mv "$A/docs" "$A/documents"
+check "renaming a folder moves its files everywhere" has "$B/documents/notes/n.txt" nested
+check "... and the old folder disappears" gone "$B/docs"
+check "... on the server too" bash -c "[ -f '$S1/documents/notes/deep.txt' ] && [ ! -e '$S1/docs' ]"
+mkdir -p "$WORK/outside/pics"
+echo p1 >"$WORK/outside/pics/p1.txt"
+mv "$WORK/outside/pics" "$A/pics"
+check "a folder moved in with files already inside is synced" has "$B/pics/p1.txt" p1
+rm -r "$A/documents"
+check "deleting a folder deletes it everywhere" gone "$B/documents"
+check "... including on the server" gone "$S1/documents"
 
 echo "== no duplicate uploads, no echo loops"
 before=$(count "$WORK/s1/server.log" "stored alice/")
@@ -158,13 +184,17 @@ check "... including the uploader's own" has "$A/external.txt" external
 
 type_in b "download big.bin"
 check "download copies the file to the current directory" same "$WORK/b/big.bin" "$A/big.bin"
+type_in b "download pics/p1.txt"
+check "download works for files in subfolders" has "$WORK/b/p1.txt" p1
 
 type_in a "list_server"
-check "list_server shows the files" bash -c "grep -A10 'Files on the server' '$WORK/a/client.log' | grep -q external.txt"
+check "list_server shows the files" bash -c "grep -A20 'Files on the server' '$WORK/a/client.log' | grep -q 'pics/p1.txt'"
 
 type_in a "delete external.txt"
 check "delete removes the file from the server" gone "$S1/external.txt"
 check "... and from every sync_dir" bash -c "[ ! -e '$A/external.txt' ] && [ ! -e '$B/external.txt' ]"
+type_in a "delete pics/p1.txt"
+check "delete works in subfolders (and empty folders go away)" bash -c "[ ! -e '$B/pics' ] && [ ! -e '$S1/pics' ]"
 
 type_in a "download nope.txt"
 check "downloading a missing file reports an error" logged "$WORK/a/client.log" "no such file on the server"
@@ -194,9 +224,20 @@ check "the server's version wins the name" has "$B/conflict.txt" from-a
 check "the other edit is kept as a conflicted copy" bash -c "[ \"\$(cat '$B'/conflict\ \(conflicted\ copy*.txt)\" = from-b ]"
 check "... which is synced to the other session too" bash -c "[ \"\$(cat '$A'/conflict\ \(conflicted\ copy*.txt)\" = from-b ]"
 
+echo "== passwords and encryption"
+one_shot_client wrong alice "$P1" not-the-password
+check_now "a wrong password is refused" logged "$WORK/wrong/client.log" "wrong password"
+one_shot_client short newbie "$P1" abc
+check_now "a too short password is refused" logged "$WORK/short/client.log" "passwords must have"
+check_now "passwords are not stored in plain text" bash -c "! grep -rq 'alice-pass1' '$WORK/s1/data'"
+check_now "... only salted hashes" grep -q '^pbkdf2-sha256\$' "$WORK/s1/data/accounts/alice"
+"$ROOT/tools/make-certs.sh" "$WORK/other-certs" >/dev/null
+mkdir -p "$WORK/other"
+(cd "$WORK/other" && printf 'alice-pass1\n' | timeout 15 "$CLIENT" alice 127.0.0.1 "$P1" --ca "$WORK/other-certs/ca.pem" >client.log 2>&1)
+check_now "a client refuses a server whose certificate it can't verify" logged "$WORK/other/client.log" "Could not connect"
+
 echo "== sessions and crashes"
-mkdir -p "$WORK/c"
-(cd "$WORK/c" && timeout 10 "$CLIENT" alice 127.0.0.1 "$P1" </dev/null >client.log 2>&1)
+one_shot_client c alice "$P1" alice-pass1
 check_now "a third session of the same user is refused" logged "$WORK/c/client.log" "already has 2 active sessions"
 
 kill_process b
@@ -211,8 +252,8 @@ check "the new session gets the files" same "$WORK/d/sync_dir/big.bin" "$S1/big.
 
 echo "== bad input sent straight to the server"
 if command -v python3 >/dev/null; then
-    if python3 "$ROOT/tests/bad_requests.py" "$P1" >"$WORK/bad_requests.log" 2>&1; then
-        pass "invalid usernames, file names and paths are refused"
+    if python3 "$ROOT/tests/bad_requests.py" "$P1" "$CERTS/ca.pem" >"$WORK/bad_requests.log" 2>&1; then
+        pass "invalid logins, paths and messages are refused; plaintext and certificate-less cluster messages too"
     else
         fail "invalid requests: $(tr '\n' ';' <"$WORK/bad_requests.log")"
     fi
@@ -236,10 +277,19 @@ start_server s2 "$P2" --join "127.0.0.1:$P1"
 start_server s3 "$P3" --join "127.0.0.1:$P1"
 check "a new backup receives the existing files" same "$WORK/s2/data/users/alice/big.bin" "$S1/big.bin"
 check "... every backup does" same "$WORK/s3/data/users/alice/big.bin" "$S1/big.bin"
+check "... and the accounts" same "$WORK/s2/data/accounts/alice" "$WORK/s1/data/accounts/alice"
 echo replicated >"$A/replicated.txt"
+mkdir -p "$A/deep/er"
+echo nested >"$A/deep/er/file.txt"
 check "new files are replicated to the backups" bash -c "[ \"\$(cat '$WORK/s2/data/users/alice/replicated.txt')\" = replicated ] && [ \"\$(cat '$WORK/s3/data/users/alice/replicated.txt')\" = replicated ]"
+check "... files in subfolders too" has "$WORK/s3/data/users/alice/deep/er/file.txt" nested
 rm "$A/restart.txt"
 check "deletions are replicated too" bash -c "[ ! -e '$WORK/s2/data/users/alice/restart.txt' ] && [ ! -e '$WORK/s3/data/users/alice/restart.txt' ]"
+
+mkdir -p "$WORK/rogue"
+(cd "$WORK/rogue" && timeout 40 "$SERVER" --port "$P5" --data data --certs "$WORK/other-certs" --join "127.0.0.1:$P1" >server.log 2>&1)
+check_now "a server without a certificate from the cluster's CA can't join" logged "$WORK/rogue/server.log" "could not join"
+check_now "... and got no files" gone "$WORK/rogue/data/users/alice"
 
 kill_process s1
 check "the first backup to join becomes the primary" logged "$WORK/s2/server.log" "is now the primary"
@@ -248,6 +298,8 @@ check "client d moves too" logged "$WORK/d/client.log" "Connected to 127.0.0.1:$
 echo after-failover >"$A/failover.txt"
 check "sync works after the failover" has "$WORK/d/sync_dir/failover.txt" after-failover
 check "the new primary replicates to the remaining backup" has "$WORK/s3/data/users/alice/failover.txt" after-failover
+one_shot_client wrong2 alice "$P2" not-the-password
+check_now "the new primary knows the password (accounts were replicated)" logged "$WORK/wrong2/client.log" "wrong password"
 
 start_server s4 "$P4" --join "127.0.0.1:$P3"
 check "a server joining through a backup is redirected and gets every file" has "$WORK/s4/data/users/alice/failover.txt" after-failover

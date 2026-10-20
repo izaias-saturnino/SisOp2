@@ -35,7 +35,7 @@ void SyncState::load()
         }
         fields.get(); // the space before the name
         std::getline(fields, info.name);
-        if (!is_valid_file_name(info.name)) {
+        if (!is_valid_path(info.name)) {
             continue;
         }
         info.hash = std::stoull(hash_hex, nullptr, 16);

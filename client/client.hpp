@@ -17,9 +17,11 @@
 
 struct ClientOptions {
     std::string user;
+    std::string password;
     std::string host;
     uint16_t port = 4000;
     std::string sync_dir = "sync_dir";
+    std::string ca_file = "certs/ca.pem"; // to verify the server's certificate
 };
 
 // The client keeps `sync_dir` in sync with the user's files on the server.
@@ -71,6 +73,9 @@ private:
     void sync_local_change(const std::string& name);
     bool handle_push(Connection& sync, const Message& msg);
     void install(const std::string& temp, const std::string& name, const FileInfo& info);
+    bool fill_hash(FileInfo& file);
+    bool local_file(const std::string& name, FileInfo& info);
+    void rescan_local();
     std::string conflict_name(const std::string& name) const;
     void enqueue(const std::string& name);
     void worker_loop();

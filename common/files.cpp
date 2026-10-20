@@ -101,6 +101,26 @@ bool is_valid_file_name(const std::string& name)
     return true;
 }
 
+bool is_valid_path(const std::string& path)
+{
+    if (path.empty() || path.size() > MAX_PATH_LENGTH) {
+        return false;
+    }
+    std::size_t depth = 0;
+    std::size_t start = 0;
+    while (true) {
+        std::size_t slash = path.find('/', start);
+        std::string component = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (!is_valid_file_name(component) || ++depth > MAX_PATH_DEPTH) {
+            return false;
+        }
+        if (slash == std::string::npos) {
+            return true;
+        }
+        start = slash + 1;
+    }
+}
+
 bool is_valid_username(const std::string& name)
 {
     if (name.empty() || name.size() > MAX_USERNAME_LENGTH) {
@@ -122,6 +142,34 @@ std::string join_path(const std::string& dir, const std::string& name)
         return dir + name;
     }
     return dir + "/" + name;
+}
+
+std::string parent_path(const std::string& path)
+{
+    std::size_t slash = path.rfind('/');
+    return slash == std::string::npos ? "" : path.substr(0, slash);
+}
+
+std::string base_name(const std::string& path)
+{
+    std::size_t slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+bool make_parent_dirs(const std::string& root, const std::string& relative_path)
+{
+    std::string parent = parent_path(relative_path);
+    return parent.empty() || make_dirs(join_path(root, parent));
+}
+
+void remove_empty_parents(const std::string& root, const std::string& relative_path)
+{
+    // rmdir only removes empty directories, so stop at the first that isn't.
+    for (std::string dir = parent_path(relative_path); !dir.empty(); dir = parent_path(dir)) {
+        if (rmdir(join_path(root, dir).c_str()) != 0) {
+            return;
+        }
+    }
 }
 
 bool make_dirs(const std::string& path)
@@ -152,8 +200,6 @@ bool stat_file(const std::string& path, FileInfo& info, bool with_hash)
     struct stat st{};
     bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
     if (ok) {
-        std::size_t slash = path.rfind('/');
-        info.name = slash == std::string::npos ? path : path.substr(slash + 1);
         info.size = static_cast<uint64_t>(st.st_size);
         info.mtime_ns = mtime_of(st);
         info.hash = 0;
@@ -165,21 +211,55 @@ bool stat_file(const std::string& path, FileInfo& info, bool with_hash)
     return ok;
 }
 
-std::vector<FileInfo> list_dir(const std::string& dir, bool with_hash)
+bool hash_file(const std::string& path, uint64_t& hash)
 {
-    std::vector<FileInfo> files;
-    DIR* d = opendir(dir.c_str());
+    FileInfo info;
+    if (!stat_file(path, info, true)) {
+        return false;
+    }
+    hash = info.hash;
+    return true;
+}
+
+namespace {
+
+void walk(const std::string& root, const std::string& relative_dir, std::size_t depth,
+          std::vector<FileInfo>& files)
+{
+    DIR* d = opendir(join_path(root, relative_dir).c_str());
     if (d == nullptr) {
-        return files;
+        return;
     }
     while (dirent* entry = readdir(d)) {
         std::string name = entry->d_name;
-        FileInfo info;
-        if (is_valid_file_name(name) && stat_file(join_path(dir, name), info, with_hash)) {
+        if (!is_valid_file_name(name)) {
+            continue; // ".", "..", reserved names
+        }
+        std::string relative = relative_dir.empty() ? name : relative_dir + "/" + name;
+        struct stat st{};
+        if (lstat(join_path(root, relative).c_str(), &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode) && depth + 1 < MAX_PATH_DEPTH) {
+            walk(root, relative, depth + 1, files);
+        } else if (S_ISREG(st.st_mode) && is_valid_path(relative)) {
+            FileInfo info;
+            info.name = relative;
+            info.size = static_cast<uint64_t>(st.st_size);
+            info.mtime_ns = mtime_of(st);
             files.push_back(info);
         }
+        // Symlinks and special files are skipped.
     }
     closedir(d);
+}
+
+} // namespace
+
+std::vector<FileInfo> list_tree(const std::string& root)
+{
+    std::vector<FileInfo> files;
+    walk(root, "", 0, files);
     std::sort(files.begin(), files.end(),
               [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
     return files;

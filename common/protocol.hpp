@@ -24,16 +24,16 @@ enum class Msg : uint16_t {
     Error = 2, // str reason
 
     // Client -> server, command connection.
-    Login = 10,     // str username
+    Login = 10,     // str username, str password
     Logout = 11,
     Ping = 12,
     ListFiles = 13,
     Upload = 14,    // u8 origin, file header, then a file body
-    Download = 15,  // str name
-    Delete = 16,    // u8 origin, str name
+    Download = 15,  // str path
+    Delete = 16,    // u8 origin, str path
 
     // Server -> client, command connection.
-    LoginOk = 20,   // u64 session token, server list
+    LoginOk = 20,   // str session token, server list
     Redirect = 21,  // str host, u16 port (empty host: primary unknown, retry later)
     Pong = 22,
     FileList = 23,  // u32 count, file infos
@@ -41,12 +41,13 @@ enum class Msg : uint16_t {
 
     // Sync connection: the client attaches it to its session, then the
     // server pushes changes made by the user's other sessions.
-    SyncAttach = 30, // u64 session token
+    SyncAttach = 30, // str session token
     PushFile = 31,   // file header, then a file body
-    PushDelete = 32, // str name
+    PushDelete = 32, // str path
     ServerList = 33, // server list
 
-    // File bodies, sent after a file header announcing the size.
+    // File bodies, sent after a file header announcing the size. File names
+    // are paths relative to the synced directory, e.g. "docs/notes.txt".
     FileData = 40,  // raw bytes
     FileEnd = 41,
     FileAbort = 42, // the sender could not read the whole file; discard it
@@ -57,11 +58,13 @@ enum class Msg : uint16_t {
     Election = 52,        // server address of the candidate
     Coordinator = 53,     // server address of the new primary
     ReplicaAttach = 54,   // primary address, server list
-    ReplicaManifest = 55, // u32 count, (str user, file info)...
+    ReplicaManifest = 55, // u32 count, (str user, str account record)...,
+                          // u32 count, (str user, file info)...
     ReplPut = 56,         // str user, file header, then a file body
-    ReplDelete = 57,      // str user, str name
+    ReplDelete = 57,      // str user, str path
     Membership = 58,      // server list
     Heartbeat = 59,
+    ReplAccount = 60,     // str user, str account record
 };
 
 // Where a client change came from: an explicit command (pushed to every

@@ -9,12 +9,15 @@ namespace {
 
 void usage(const char* program)
 {
-    std::cerr << "usage: " << program << " [--port PORT] [--host HOST] [--data DIR] [--join HOST:PORT]\n"
+    std::cerr << "usage: " << program
+              << " [--port PORT] [--host HOST] [--data DIR] [--certs DIR] [--join HOST:PORT]\n"
               << "\n"
               << "  --port PORT       port to listen on (default 4000)\n"
               << "  --host HOST       address other servers and clients use to reach this one\n"
-              << "                    (default 127.0.0.1; set it when running on several machines)\n"
+              << "                    (default 127.0.0.1; set it when running on several machines,\n"
+              << "                    and include it in the certificate: tools/make-certs.sh)\n"
               << "  --data DIR        where to keep the files (default server_data_<port>)\n"
+              << "  --certs DIR       ca.pem, server.pem and server.key (default certs)\n"
               << "  --join HOST:PORT  join the cluster that server belongs to, as a backup;\n"
               << "                    without it, this server starts a new cluster as the primary\n"
               << "\n"
@@ -38,6 +41,8 @@ int main(int argc, char* argv[])
             options.host = argv[++i];
         } else if (arg == "--data" && has_value) {
             options.data_dir = argv[++i];
+        } else if (arg == "--certs" && has_value) {
+            options.certs_dir = argv[++i];
         } else if (arg == "--join" && has_value) {
             if (!parse_endpoint(argv[++i], options.join_host, options.join_port)) {
                 std::cerr << "invalid address (expected HOST:PORT): " << argv[i] << "\n";

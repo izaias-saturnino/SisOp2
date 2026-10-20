@@ -5,6 +5,9 @@ build/
 server_data_*/
 sync_dir/
 
+# Certificates and private keys (make certs / tools/make-certs.sh)
+certs/
+
 # Editor settings
 .vscode/settings.json
 

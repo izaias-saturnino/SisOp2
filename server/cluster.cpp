@@ -36,8 +36,9 @@ void upsert(std::vector<ServerAddress>& list, const ServerAddress& server)
 
 } // namespace
 
-Cluster::Cluster(std::string host, uint16_t port, Storage& storage, std::mutex& write_mutex)
-    : storage_(storage), write_mutex_(write_mutex)
+Cluster::Cluster(std::string host, uint16_t port, Storage& storage, Accounts& accounts,
+                 std::mutex& write_mutex)
+    : storage_(storage), accounts_(accounts), write_mutex_(write_mutex)
 {
     self_.host = std::move(host);
     self_.port = port;
@@ -76,7 +77,7 @@ bool Cluster::join(const std::string& host, uint16_t port)
     std::string target_host = host;
     uint16_t target_port = port;
 
-    for (int attempt = 0; attempt < 30 && !stopping_; ++attempt) {
+    for (int attempt = 0; attempt < 10 && !stopping_; ++attempt) {
         if (ConnectionPtr conn = connect_to(target_host, target_port, CONNECT_TIMEOUT_MS)) {
             Writer request;
             ServerAddress me = self();
@@ -248,10 +249,11 @@ bool Cluster::attach_replica(const ServerAddress& member)
     // Hash our own files first so the backup isn't left waiting on the link.
     std::map<FileKey, FileInfo> local;
     for (const std::string& user : storage_.users()) {
-        for (const FileInfo& file : storage_.list(user, true)) {
+        for (const FileInfo& file : storage_.list(user)) {
             local[{user, file.name}] = file;
         }
     }
+    std::vector<std::pair<std::string, std::string>> local_accounts = accounts_.all();
 
     ConnectionPtr conn = connect_to(member.host, member.port, CONNECT_TIMEOUT_MS);
     if (!conn) {
@@ -271,11 +273,17 @@ bool Cluster::attach_replica(const ServerAddress& member)
         return false;
     }
 
+    std::map<std::string, std::string> remote_accounts;
     std::map<FileKey, FileInfo> remote;
     try {
         Reader r(manifest.payload);
-        uint32_t count = r.u32();
-        for (uint32_t i = 0; i < count; ++i) {
+        uint32_t accounts = r.u32();
+        for (uint32_t i = 0; i < accounts; ++i) {
+            std::string user = r.str();
+            remote_accounts[user] = r.str();
+        }
+        uint32_t files = r.u32();
+        for (uint32_t i = 0; i < files; ++i) {
             std::string user = r.str();
             FileInfo file = read_file_info(r);
             remote[{user, file.name}] = file;
@@ -284,6 +292,13 @@ bool Cluster::attach_replica(const ServerAddress& member)
         return false;
     }
 
+    for (const auto& account : local_accounts) {
+        auto it = remote_accounts.find(account.first);
+        if ((it == remote_accounts.end() || it->second != account.second) &&
+            !account_on_link(*link, account.first, account.second)) {
+            return false;
+        }
+    }
     int sent = 0;
     int deleted = 0;
     for (const auto& entry : local) {
@@ -352,6 +367,30 @@ bool Cluster::delete_on_link(Link& link, const std::string& user, const std::str
     Message reply;
     return call(*link.conn, Msg::ReplDelete, w.data(), Msg::Ok, reply, REPLY_TIMEOUT_MS) ==
            CallResult::Ok;
+}
+
+// Caller holds link.txn.
+bool Cluster::account_on_link(Link& link, const std::string& user, const std::string& record)
+{
+    Writer w;
+    w.str(user).str(record);
+    Message reply;
+    return call(*link.conn, Msg::ReplAccount, w.data(), Msg::Ok, reply, REPLY_TIMEOUT_MS) ==
+           CallResult::Ok;
+}
+
+void Cluster::replicate_account(const std::string& user, const std::string& record)
+{
+    std::vector<uint32_t> failed;
+    for (const LinkPtr& link : links_snapshot()) {
+        std::lock_guard<std::mutex> txn(link->txn);
+        if (!account_on_link(*link, user, record)) {
+            failed.push_back(link->member.id);
+        }
+    }
+    for (uint32_t id : failed) {
+        drop_link(id, "could not replicate an account");
+    }
 }
 
 void Cluster::replicate_put(const std::string& user, const std::string& name)
@@ -552,7 +591,7 @@ bool Cluster::apply_replicated(Connection& conn, const Message& msg)
             return false;
         }
         bool ok = result == TransferResult::Ok && is_valid_username(user) &&
-                  is_valid_file_name(info.name);
+                  is_valid_path(info.name);
         if (ok) {
             std::lock_guard<std::mutex> write(write_mutex_);
             ok = storage_.commit(user, info.name, temp, info.mtime_ns);
@@ -568,7 +607,7 @@ bool Cluster::apply_replicated(Connection& conn, const Message& msg)
         Reader r(msg.payload);
         std::string user = r.str();
         std::string name = r.str();
-        if (is_valid_username(user) && is_valid_file_name(name)) {
+        if (is_valid_username(user) && is_valid_path(name)) {
             std::lock_guard<std::mutex> write(write_mutex_);
             if (storage_.remove(user, name)) {
                 LOG_INFO("replicated delete of " << user << "/" << name);
@@ -587,6 +626,16 @@ bool Cluster::apply_replicated(Connection& conn, const Message& msg)
         notify_membership();
         return conn.send(Msg::Ok);
     }
+    case Msg::ReplAccount: {
+        Reader r(msg.payload);
+        std::string user = r.str();
+        std::string record = r.str();
+        if (!is_valid_username(user) || !Accounts::is_valid_record(record) || !accounts_.put(user, record)) {
+            return send_error(conn, "could not store the replicated account");
+        }
+        LOG_INFO("replicated the account of " << user);
+        return conn.send(Msg::Ok);
+    }
     case Msg::Heartbeat:
         return conn.send(Msg::Ok);
     default:
@@ -599,11 +648,16 @@ std::string Cluster::build_manifest()
 {
     std::vector<std::pair<std::string, FileInfo>> entries;
     for (const std::string& user : storage_.users()) {
-        for (const FileInfo& file : storage_.list(user, true)) {
+        for (const FileInfo& file : storage_.list(user)) {
             entries.emplace_back(user, file);
         }
     }
+    std::vector<std::pair<std::string, std::string>> accounts = accounts_.all();
     Writer w;
+    w.u32(static_cast<uint32_t>(accounts.size()));
+    for (const auto& account : accounts) {
+        w.str(account.first).str(account.second);
+    }
     w.u32(static_cast<uint32_t>(entries.size()));
     for (const auto& entry : entries) {
         w.str(entry.first);

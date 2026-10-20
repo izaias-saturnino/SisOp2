@@ -10,28 +10,42 @@
 // files (temporary downloads, the client's sync state) and are never synced.
 constexpr const char* RESERVED_PREFIX = ".sisop";
 constexpr std::size_t MAX_NAME_LENGTH = 255;
+constexpr std::size_t MAX_PATH_LENGTH = 1024;
+constexpr std::size_t MAX_PATH_DEPTH = 32;
 constexpr std::size_t MAX_USERNAME_LENGTH = 32;
 
 struct FileInfo {
-    std::string name;
+    std::string name;     // path relative to the synced directory, e.g. "docs/notes.txt"
     uint64_t size = 0;
     int64_t mtime_ns = 0; // modification time, nanoseconds since the epoch
     uint64_t hash = 0;    // FNV-1a of the contents (0 when not computed)
 };
 
 // A file name is a single path component: not empty, not "." or "..", no
-// '/', no control characters, not reserved. This is what keeps clients from
-// reaching outside their own directory.
+// '/', no control characters, not reserved.
 bool is_valid_file_name(const std::string& name);
+// A relative path: valid file names joined by single '/' (no leading or
+// trailing '/'). This is what keeps clients from reaching outside their own
+// directory.
+bool is_valid_path(const std::string& path);
 // Usernames become directory names: letters, digits, '_' and '-' only.
 bool is_valid_username(const std::string& name);
 
 std::string join_path(const std::string& dir, const std::string& name);
+std::string parent_path(const std::string& path); // "" for a top-level name
+std::string base_name(const std::string& path);
 bool make_dirs(const std::string& path);
-// Fills `info` for a regular file (symlinks and directories are rejected).
+// Creates the directories leading to root/relative_path.
+bool make_parent_dirs(const std::string& root, const std::string& relative_path);
+// Removes the now-empty directories leading to root/relative_path, stopping at root.
+void remove_empty_parents(const std::string& root, const std::string& relative_path);
+// Fills size, mtime and (optionally) hash for a regular file; symlinks and
+// directories are rejected. Leaves info.name alone.
 bool stat_file(const std::string& path, FileInfo& info, bool with_hash);
-// The regular files in `dir` whose names are valid, sorted by name.
-std::vector<FileInfo> list_dir(const std::string& dir, bool with_hash);
+bool hash_file(const std::string& path, uint64_t& hash);
+// Every regular file under `root` whose path is valid, sorted by path, with
+// names relative to root. Symlinks are not followed. Hashes not computed.
+std::vector<FileInfo> list_tree(const std::string& root);
 bool set_mtime(const std::string& path, int64_t mtime_ns);
 // True if the file existed and was removed.
 bool remove_file(const std::string& path);
