@@ -69,6 +69,7 @@ public:
     void handle_election(const ConnectionPtr& conn, const Message& first);
     void handle_coordinator(const ConnectionPtr& conn, const Message& first);
     void handle_replica_attach(const ConnectionPtr& conn, const Message& first);
+    void handle_status(const ConnectionPtr& conn);
 
     // Primary only. The caller must hold the write mutex, so backups apply
     // changes in the same order as the primary.

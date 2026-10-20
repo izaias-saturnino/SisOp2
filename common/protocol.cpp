@@ -35,6 +35,9 @@ const char* msg_name(Msg type)
     case Msg::Membership: return "Membership";
     case Msg::Heartbeat: return "Heartbeat";
     case Msg::ReplAccount: return "ReplAccount";
+    case Msg::StatusRequest: return "StatusRequest";
+    case Msg::Status: return "Status";
+    case Msg::Notice: return "Notice";
     }
     return "Unknown";
 }

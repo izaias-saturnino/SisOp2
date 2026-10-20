@@ -842,6 +842,19 @@ void Cluster::handle_election(const ConnectionPtr& conn, const Message& first)
     }).detach();
 }
 
+// Tells another server which cluster this one belongs to (see HealthMonitor).
+void Cluster::handle_status(const ConnectionPtr& conn)
+{
+    Writer w;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uint8_t role = role_ == Role::Primary ? 2 : role_ == Role::Backup ? 1 : 0;
+        w.u8(role).u8(primary_known_ ? 1 : 0);
+        write_server(w, primary_known_ ? primary_ : ServerAddress{});
+    }
+    conn->send(Msg::Status, w.data());
+}
+
 void Cluster::handle_coordinator(const ConnectionPtr& conn, const Message& first)
 {
     Reader r(first.payload);

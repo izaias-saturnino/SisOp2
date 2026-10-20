@@ -45,6 +45,7 @@ enum class Msg : uint16_t {
     PushFile = 31,   // file header, then a file body
     PushDelete = 32, // str path
     ServerList = 33, // server list
+    Notice = 34,     // str text: a cluster problem (or its resolution) to show the user
 
     // File bodies, sent after a file header announcing the size. File names
     // are paths relative to the synced directory, e.g. "docs/notes.txt".
@@ -65,6 +66,9 @@ enum class Msg : uint16_t {
     Membership = 58,      // server list
     Heartbeat = 59,
     ReplAccount = 60,     // str user, str account record
+    StatusRequest = 61,   // "which cluster are you in?" (used to check expected servers)
+    Status = 62,          // u8 role (0 joining, 1 backup, 2 primary), u8 primary known,
+                          // primary address
 };
 
 // Where a client change came from: an explicit command (pushed to every

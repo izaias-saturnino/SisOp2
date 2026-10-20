@@ -66,7 +66,7 @@ check_now() {
 has() { [ "$(cat "$1")" = "$2" ]; }              # has FILE CONTENT
 gone() { [ ! -e "$1" ]; }
 same() { cmp -s "$1" "$2"; }
-logged() { grep -q -- "$2" "$1"; }                # logged LOGFILE PATTERN
+logged() { grep -qF -- "$2" "$1"; }               # logged LOGFILE TEXT
 alive() { kill -0 "${PIDS[$1]}"; }
 count() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }
@@ -264,17 +264,28 @@ else
     echo "  skip  python3 not found"
 fi
 
+EXPECT="127.0.0.1:$P1,127.0.0.1:$P2,127.0.0.1:$P3"
+
 echo "== server restart"
 kill_process s1
-start_server s1 "$P1"
+start_server s1 "$P1" --expect "$EXPECT"
 check_now "the server can listen on the same port again right away" alive s1
 check "clients reconnect by themselves" bash -c "[ \$(grep -c 'Connected to' '$WORK/a/client.log') -ge 2 ]"
 echo after-restart >"$A/restart.txt"
 check "sync works again" has "$WORK/d/sync_dir/restart.txt" after-restart
 
+echo "== expected servers (--expect)"
+check "the primary flags expected servers that aren't running" logged "$WORK/s1/server.log" "127.0.0.1:$P2 is not running"
+check "... and tells the clients" logged "$WORK/a/client.log" "[cluster] warning: expected server 127.0.0.1:$P2 is not running"
+start_server lone "$P3" # a cluster of its own, as if started without --join
+check "a server running on its own is flagged as a separate primary" logged "$WORK/s1/server.log" "127.0.0.1:$P3 is running as a separate primary"
+check "... clients see that too" logged "$WORK/d/client.log" "127.0.0.1:$P3 is running as a separate primary"
+kill_process lone
+
 echo "== replication and failover"
-start_server s2 "$P2" --join "127.0.0.1:$P1"
-start_server s3 "$P3" --join "127.0.0.1:$P1"
+start_server s2 "$P2" --join "127.0.0.1:$P1" --expect "$EXPECT"
+start_server s3 "$P3" --join "127.0.0.1:$P1" --expect "$EXPECT"
+check "once every expected server is up, clients are told" logged "$WORK/a/client.log" "[cluster] all 3 expected servers are up"
 check "a new backup receives the existing files" same "$WORK/s2/data/users/alice/big.bin" "$S1/big.bin"
 check "... every backup does" same "$WORK/s3/data/users/alice/big.bin" "$S1/big.bin"
 check "... and the accounts" same "$WORK/s2/data/accounts/alice" "$WORK/s1/data/accounts/alice"
@@ -295,6 +306,7 @@ kill_process s1
 check "the first backup to join becomes the primary" logged "$WORK/s2/server.log" "is now the primary"
 check "client a moves to the new primary" logged "$WORK/a/client.log" "Connected to 127.0.0.1:$P2"
 check "client d moves too" logged "$WORK/d/client.log" "Connected to 127.0.0.1:$P2"
+check "the new primary flags the server that went down, to its clients too" logged "$WORK/a/client.log" "expected server 127.0.0.1:$P1 is not running"
 echo after-failover >"$A/failover.txt"
 check "sync works after the failover" has "$WORK/d/sync_dir/failover.txt" after-failover
 check "the new primary replicates to the remaining backup" has "$WORK/s3/data/users/alice/failover.txt" after-failover

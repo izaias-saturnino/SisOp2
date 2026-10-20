@@ -85,7 +85,7 @@ Commands, typed into the client's terminal:
 ### Server
 
 ```bash
-./build/server [--port PORT] [--host HOST] [--data DIR] [--certs DIR] [--join HOST:PORT]
+./build/server [--port PORT] [--host HOST] [--data DIR] [--certs DIR] [--join HOST:PORT] [--expect HOST:PORT,...]
 ```
 
 | Option | Meaning |
@@ -95,6 +95,7 @@ Commands, typed into the client's terminal:
 | `--data` | Where files are stored, as `DIR/users/<username>/<path>`, with accounts in `DIR/accounts/`. Default: `server_data_<port>`. |
 | `--certs` | Directory holding `ca.pem`, `server.pem` and `server.key`. Default: `certs`. |
 | `--join` | Join an existing cluster as a backup, by giving the address of any of its servers. Without it, the server starts a new cluster and is its primary. |
+| `--expect` | The servers that should be in the cluster, comma-separated (this server may be included). A warning is raised as soon as one is missing; see [Expected servers](#expected-servers). |
 
 ### Certificates
 
@@ -138,6 +139,31 @@ On several machines, give each server its own `--host`, and make sure every host
 ./build/server --host 10.0.0.2 --join 10.0.0.1:4000
 ```
 
+### Expected servers
+
+The cluster survives crashes, but not network splits (see [Limitations](#limitations)). When everyone runs it locally, the useful thing is to know about a problem the moment it happens. Give every server the list of servers that should be up:
+
+```bash
+./build/server --port 4000 --expect 127.0.0.1:4000,127.0.0.1:4001,127.0.0.1:4002
+```
+
+```bash
+./build/server --port 4001 --join 127.0.0.1:4000 --expect 127.0.0.1:4000,127.0.0.1:4001,127.0.0.1:4002
+```
+
+Every two seconds, each server checks that every expected server is a member of its cluster. For one that isn't, it asks that server directly which cluster it belongs to, which tells three cases apart:
+
+| Warning | Meaning |
+|---|---|
+| `expected server … is not running (or can't be reached)` | It's down, or the network can't reach it. |
+| `expected server … is running as a separate primary` | It's running a cluster of its own: either a network split, or it was started without `--join`. |
+| `expected server … follows a different primary` | The cluster is split in two. |
+
+How warnings are raised:
+- **Immediately, in the server's log.** Ongoing problems are repeated every 30 seconds while they last.
+- **On every client's terminal.** The primary pushes each warning to its clients, prefixed with `[cluster]`, and a client that connects while there's a problem is told right away.
+- **When things recover,** every server that comes back is announced, followed by `all N expected servers are up`.
+
 ---
 
 ## How it works
@@ -157,6 +183,7 @@ On several machines, give each server its own `--host`, and make sure every host
 | `server/sessions.*` | Logged-in sessions (at most two per user). |
 | `server/storage.*` | Files on disk, with atomic updates and a hash cache. |
 | `server/cluster.*` | Replication, failure detection and leader election. |
+| `server/health.*` | The `--expect` check for missing or separated servers. |
 | `client/client.*` | Connection handling, reconciliation, the commands. |
 | `client/sync_state.*` | The record of what was last in sync. |
 | `client/watcher.*` | Recursive inotify on `sync_dir`. |
@@ -195,7 +222,7 @@ The server runs one thread per connection. The first message on a connection say
 
 - **Encryption:** every connection (client to server, and server to server) is TLS 1.2 or newer; in practice TLS 1.3 is negotiated.
 - **Verifying the server:** clients check the server's certificate against the cluster's CA, including that the host they connected to is named in it. A machine pretending to be the server, or one in the middle of the connection, is refused.
-- **Server-to-server messages:** servers present their certificate when they connect to each other (mutual TLS). Cluster messages (`Join`, `Election`, `Coordinator`, `ReplicaAttach`) are only accepted from a peer with a valid certificate. A machine that isn't part of the cluster can't join it, call an election, or pose as a primary to receive copies of everyone's files.
+- **Server-to-server messages:** servers present their certificate when they connect to each other (mutual TLS). Cluster messages (`Join`, `Election`, `Coordinator`, `ReplicaAttach`, `StatusRequest`) are only accepted from a peer with a valid certificate. A machine that isn't part of the cluster can't join it, call an election, or pose as a primary to receive copies of everyone's files.
 - **Passwords:**
   - stored as PBKDF2-HMAC-SHA256 hashes, with a random 16-byte salt and 100,000 iterations, in `<data>/accounts/<user>`;
   - compared in constant time;
@@ -296,7 +323,7 @@ sequenceDiagram
 make test
 ```
 
-This runs `tests/integration.sh`, 72 checks with real servers and clients on random local ports. It generates its own certificates. Among other things, it checks:
+This runs `tests/integration.sh`, 78 checks with real servers and clients on random local ports. It generates its own certificates. Among other things, it checks:
 - sync between sessions, including a 3 MB file, names with spaces and empty files;
 - subfolders: nested files, renaming a folder, moving a folder in, deleting a folder;
 - that each change is uploaded exactly once and never bounces back;
@@ -309,6 +336,7 @@ This runs `tests/integration.sh`, 72 checks with real servers and clients on ran
 - invalid logins and paths, plaintext connections and certificate-less cluster messages sent straight to the server (`tests/bad_requests.py`, needs python3);
 - a server restart;
 - replication of files and accounts;
+- missing and stray servers flagged by `--expect`, in server logs and client terminals;
 - failover, with clients moving to the new primary and passwords still checked there;
 - a server joining through a backup;
 - a server with a certificate from another CA being refused.
@@ -328,5 +356,5 @@ This is a teaching prototype:
 - **Folders:** empty folders aren't synced; only files (and the folders that contain them) are.
 - **Transfers:** files are sent whole. There are no deltas and no resuming of interrupted transfers; a transfer that fails is simply redone.
 - **Replication cost:** replication is synchronous, so a slow backup slows uploads down. While a backup is being brought up to date (joining, or after an election), changes wait.
-- **Partitions:** the design handles crashes, not network partitions. If the network splits the servers into groups that can't see each other, each group can elect its own primary, and their files diverge. A partial fix is easy (a primary steps down when it can't reach a majority, and an election needs a majority), but on its own that can still lose a change a client was told succeeded. Doing it properly takes a consensus protocol such as Raft: numbered terms, a replicated log, and only the most up-to-date server being allowed to win an election.
+- **Partitions:** the design handles crashes, not network partitions. If the network splits the servers into groups that can't see each other, each group can elect its own primary, and their files diverge. Use [`--expect`](#expected-servers) to be warned the moment that happens. A partial fix is easy (a primary steps down when it can't reach a majority, and an election needs a majority), but on its own that can still lose a change a client was told succeeded. Doing it properly takes a consensus protocol such as Raft: numbered terms, a replicated log, and only the most up-to-date server being allowed to win an election.
 - **Sessions:** sessions live in memory on the primary. After a failover, clients log in again (automatically); files aren't affected.

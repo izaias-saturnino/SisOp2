@@ -3,6 +3,7 @@
 #include "../common/connection.hpp"
 #include "accounts.hpp"
 #include "cluster.hpp"
+#include "health.hpp"
 #include "sessions.hpp"
 #include "storage.hpp"
 
@@ -17,6 +18,7 @@ struct ServerOptions {
     std::string certs_dir = "certs"; // ca.pem, server.pem, server.key
     std::string join_host;          // empty: start a new cluster
     uint16_t join_port = 0;
+    std::vector<Endpoint> expected; // servers that should be in the cluster (--expect)
 };
 
 // Accepts connections and serves them, one thread per connection. The first
@@ -48,6 +50,7 @@ private:
     void push_file(const std::string& user, const std::string& path, const std::string& except);
     void push_delete(const std::string& user, const std::string& path, const std::string& except);
     void push_server_list(const std::vector<ServerAddress>& servers);
+    void push_notice(const std::string& text);
     void send_redirect(Connection& conn);
 
     ServerOptions options_;
@@ -56,4 +59,5 @@ private:
     std::mutex write_mutex_; // serializes changes (files and accounts) and their replication
     SessionManager sessions_;
     Cluster cluster_;
+    HealthMonitor health_;
 };

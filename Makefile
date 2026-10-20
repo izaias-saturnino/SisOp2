@@ -8,7 +8,7 @@ BUILD := build
 COMMON := common/log.cpp common/protocol.cpp common/connection.cpp common/net.cpp common/files.cpp \
           common/tls.cpp
 SERVER := server/main.cpp server/server.cpp server/storage.cpp server/sessions.cpp server/cluster.cpp \
-          server/accounts.cpp
+          server/accounts.cpp server/health.cpp
 CLIENT := client/main.cpp client/client.cpp client/sync_state.cpp client/watcher.cpp
 
 COMMON_OBJ := $(COMMON:%.cpp=$(BUILD)/obj/%.o)

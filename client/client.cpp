@@ -729,6 +729,11 @@ bool Client::handle_push(Connection& sync, const Message& msg)
             servers_ = servers;
             return true;
         }
+        case Msg::Notice: {
+            Reader r(msg.payload);
+            say("[cluster] " + r.str());
+            return true;
+        }
         default:
             LOG_WARN("unexpected " << msg_name(msg.type) << " on the sync connection");
             return true;

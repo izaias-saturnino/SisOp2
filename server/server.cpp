@@ -25,7 +25,7 @@ std::string short_token(const std::string& token)
 bool is_cluster_message(Msg type)
 {
     return type == Msg::Join || type == Msg::Election || type == Msg::Coordinator ||
-           type == Msg::ReplicaAttach;
+           type == Msg::ReplicaAttach || type == Msg::StatusRequest;
 }
 
 } // namespace
@@ -35,7 +35,8 @@ Server::Server(ServerOptions options)
       storage_(options_.data_dir.empty() ? "server_data_" + std::to_string(options_.port)
                                          : options_.data_dir),
       accounts_(storage_.accounts_dir()),
-      cluster_(options_.host, options_.port, storage_, accounts_, write_mutex_)
+      cluster_(options_.host, options_.port, storage_, accounts_, write_mutex_),
+      health_(cluster_, options_.expected, [this](const std::string& text) { push_notice(text); })
 {
 }
 
@@ -72,6 +73,7 @@ int Server::run()
         return 1;
     }
     cluster_.start_monitor();
+    health_.start();
     LOG_INFO("listening on port " << options_.port << ", data in " << storage_.root());
 
     while (true) {
@@ -108,6 +110,7 @@ void Server::handle_connection(int fd, std::string peer)
         case Msg::Election: cluster_.handle_election(conn, first); break;
         case Msg::Coordinator: cluster_.handle_coordinator(conn, first); break;
         case Msg::ReplicaAttach: cluster_.handle_replica_attach(conn, first); break;
+        case Msg::StatusRequest: cluster_.handle_status(conn); break;
         default:
             LOG_WARN(conn->peer() << " opened with unexpected " << msg_name(first.type));
             send_error(*conn, "unexpected message");
@@ -370,6 +373,16 @@ void Server::serve_sync(const ConnectionPtr& conn, const Message& attach)
             return;
         }
         conn->send_locked(Msg::Ok);
+        // A client connecting while the cluster is degraded hears about it now.
+        std::string problems = health_.problems();
+        for (std::size_t start = 0; start < problems.size();) {
+            std::size_t end = problems.find('\n', start);
+            if (end == std::string::npos) end = problems.size();
+            Writer notice;
+            notice.str(problems.substr(start, end - start));
+            conn->send_locked(Msg::Notice, notice.data());
+            start = end + 1;
+        }
     }
     // Clients never send on this connection; reading only tells us when it
     // closes (the session closing it, or the client going away).
@@ -397,6 +410,18 @@ void Server::push_delete(const std::string& user, const std::string& path, const
         if (!sync->send(Msg::PushDelete, w.data())) {
             sync->shutdown();
         }
+    }
+}
+
+void Server::push_notice(const std::string& text)
+{
+    if (!cluster_.is_primary()) {
+        return; // only the primary has clients
+    }
+    Writer w;
+    w.str(text);
+    for (const ConnectionPtr& sync : sessions_.all_sync_connections()) {
+        sync->send(Msg::Notice, w.data());
     }
 }
 
