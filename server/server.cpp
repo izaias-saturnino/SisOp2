@@ -64,6 +64,9 @@ int main(int argc, char *argv[])
 	sigemptyset(&sigIntHandler.sa_mask);
 	sigIntHandler.sa_flags = 0;
 
+    // writing to a socket whose peer is gone must return EPIPE instead of killing the server
+    signal(SIGPIPE, SIG_IGN);
+
     //
     struct sockaddr_in serv_addr;
 
@@ -109,8 +112,6 @@ int main(int argc, char *argv[])
 
     cout << "server sync ended" << endl << endl;
 
-    SESSION session;
-
     while (true)
     {
         /*listen to clients*/
@@ -127,9 +128,6 @@ int main(int argc, char *argv[])
 
         int newSockfd;
         newSockfd = accept(connectionSocket, (struct sockaddr *)&cli_addr, &clilen);
-        
-        session.socketAddrClient = cli_addr;
-        session.socket = newSockfd;
 
         if (newSockfd == -1){
             cout << "ERROR on accept" << endl;
@@ -140,19 +138,36 @@ int main(int argc, char *argv[])
 
         cout << "read0" << endl;
         PACKET pkt;
-        peekSocket(&pkt, newSockfd);
+        if(peekSocket(&pkt, newSockfd) <= 0){
+            cout << "connection closed before first message" << endl;
+            client_connections.pop_back();
+            close(newSockfd);
+            continue;
+        }
         if(pkt.type == MENSAGEM_LOGIN){
-            session.socket = newSockfd;
-            memcpy(session.user, pkt._payload, BUFFER_SIZE);
+            // one SESSION per connection (freed by ThreadClient): a single shared
+            // variable could be overwritten by the next accept before the thread copied it
+            SESSION *session = new SESSION;
+            session->socketAddrClient = cli_addr;
+            session->socket = newSockfd;
+            memcpy(session->user, pkt._payload, BUFFER_SIZE);
             pthread_t clientThread;
             cout << "creating client thread" << endl;
-            create_thread(&clientThread, NULL, ThreadClient, &session);
+            create_thread(&clientThread, NULL, ThreadClient, session);
         }
         else if(pkt.type == GET_SYNC_DIR){
             cout << "reading GET_SYNC_DIR" << endl;
             readSocket(&pkt, newSockfd);
             char user[BUFFER_SIZE];
-            strcpy(user, pkt._payload);
+            strncpy(user, pkt._payload, BUFFER_SIZE - 1);
+            user[BUFFER_SIZE - 1] = '\0';
+
+            if(!is_valid_username(string(user)) || !fs::is_directory("./" + string(user))){
+                cout << "GET_SYNC_DIR refused for user: " << user << endl;
+                client_connections.pop_back();
+                close(newSockfd);
+                continue;
+            }
 
             //baixar todos os arquivos do syncdir do servidor
             vector<string> file_paths = get_file_list("./" + string(user));
@@ -598,9 +613,13 @@ void* check_main_server_up(void *arg){
     cout << "check_main_server_up running" << endl;
     while(true){
         //cout << "sending LIVENESS_CHECK" << endl;
-        sendMessage("", LIVENESS_CHECK, server_socket);
         //cout << "reading LIVENESS_CHECK ack" << endl;
-        readSocket(&pkt, server_socket);
+        if(sendMessage("", LIVENESS_CHECK, server_socket) < 0 || readSocket(&pkt, server_socket) <= 0){
+            // stop here; the timer thread keeps counting down and starts the election
+            cout << "lost connection to main server" << endl;
+            close(server_socket);
+            return 0;
+        }
         //cout << "timer_countdown == MAX_TIMER" << endl;
         timer_countdown = MAX_TIMER;
     }
@@ -613,9 +632,12 @@ void *answer_server_up(void *arg){
     cout << "answer_server_up running" << endl;
     while(true){
         //cout << "sending LIVENESS_CHECK ack" << endl;
-        sendMessage("", ACK, server_socket);
         //cout << "reading LIVENESS_CHECK" << endl;
-        readSocket(&pkt, server_socket);
+        if(sendMessage("", ACK, server_socket) < 0 || readSocket(&pkt, server_socket) <= 0){
+            cout << "backup server disconnected" << endl;
+            close(server_socket);
+            return 0;
+        }
     }
     return 0;
 }
@@ -696,16 +718,31 @@ vector<int> connect_to_non_main_servers(SESSION session){
 void *ThreadClient(void *arg)
 {
     SESSION session = *(SESSION *)arg;
+    delete (SESSION *)arg;
     int sockfd = session.socket;
     char user[BUFFER_SIZE];
     memcpy(user, session.user, BUFFER_SIZE);
+    user[BUFFER_SIZE - 1] = '\0';
     Sockaddr_in sock_addr =  session.socketAddrClient;
+
+    // the username becomes a directory name, so "..", "a/b" etc. would escape ./<user>
+    if(!is_valid_username(string(user))){
+        cout << "invalid username: " << user << endl;
+        if(main_server){
+            PACKET login_pkt;
+            readSocket(&login_pkt, sockfd);
+            sendMessage((char*)"Nome de usuario invalido", MENSAGEM_USUARIO_INVALIDO, sockfd);
+        }
+        close(sockfd);
+        return 0;
+    }
 
     if(main_server){
 
     bool login_successful = client_login(session);
 
         if(!login_successful){
+            close(sockfd);
             return 0;
         }
     }
@@ -730,7 +767,18 @@ void *ThreadClient(void *arg)
     {
         memset(pkt._payload, 0, BUFFER_SIZE);
         cout << "reading client msg" << endl;
-        readSocket(&pkt, sockfd);
+        if (readSocket(&pkt, sockfd) <= 0)
+        {
+            // client crashed or lost its connection without sending MENSAGEM_LOGOUT
+            cout << string(user) << " connection closed" << endl;
+            if(main_server){
+                loginManager->Logout(user, sockfd, resposta);
+            }
+            else{
+                close(sockfd);
+            }
+            break;
+        }
         cout << "pkt.type: " << pkt.type << ". ";
 
         if(last_number_of_servers < number_of_servers && main_server){
@@ -741,18 +789,21 @@ void *ThreadClient(void *arg)
             last_number_of_servers = number_of_servers;
         }
 
+        // client heartbeat: receiving it is enough (the client detects a dead server
+        // when the send fails). not answered, so no reply gets mixed into the
+        // command stream, and not forwarded to the backups
+        if (pkt.type == MENSAGEM_VERIFICACAO)
+        {
+            continue;
+        }
+
         if(main_server && pkt.type != MENSAGEM_ENVIO_NOME_ARQUIVO){
             for (int i = 0; i < other_servers_sockets.size(); i++)
             {
                 sendMessage(pkt._payload, pkt.type, other_servers_sockets[i]);
             }
         }
-        if (pkt.type == MENSAGEM_VERIFICACAO)
-        {
-            sendMessage("ESTOU VIVO", pkt.type, sockfd);
-            break;
-        }
- 
+
         if (pkt.type == MENSAGEM_LOGOUT)
         {
             if(!main_server){
@@ -773,6 +824,13 @@ void *ThreadClient(void *arg)
             string file_name = getFileName(string(pkt._payload));
             cout << "receiving file" << endl;
             cout << "file name: " << file_name << endl;
+            if(!is_valid_file_name(file_name)){
+                // still read the whole transfer so the stream stays in sync
+                cout << "invalid file name, discarding upload" << endl;
+                receiveFile(sockfd, "/dev/null", &pkt);
+                file_received_from_sync = false;
+                continue;
+            }
             string directory = "./";
             directory = directory + user + "/" + file_name;
             cout << directory << "\n" << endl;
@@ -830,6 +888,11 @@ void *ThreadClient(void *arg)
             string file_name = getFileName(string(pkt._payload));
             cout << "removing file" << endl;
             cout << "file name: " << file_name << endl << endl;
+            if(!is_valid_file_name(file_name)){
+                // "delete .." used to remove_all() the server's working directory
+                cout << "invalid file name, delete refused" << endl;
+                continue;
+            }
             string file_path = "./";
             file_path = file_path + user + "/" + file_name;
 
@@ -859,11 +922,20 @@ void *ThreadClient(void *arg)
             if(!main_server){
                 continue;
             }
+            string file_name = getFileName(string(pkt._payload));
+            if(!is_valid_file_name(file_name)){
+                cout << "invalid file name, download refused" << endl;
+                sendMessage((char*) "", MENSAGEM_FALHA_ENVIO, sockfd);
+                continue;
+            }
             string directory = "./";
-            directory = directory + user + "/" + string(pkt._payload);
+            directory = directory + user + "/" + file_name;
             send_file_to_client(sockfd, directory);
         }
     }
+
+    // lets the backups' copies of this session see the connection close
+    clear_connections(other_servers_sockets);
 
     return 0;
 }

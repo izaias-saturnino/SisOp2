@@ -23,6 +23,9 @@ int main(int argc, char *argv[])
 	sigemptyset(&sigIntHandler.sa_mask);
 	sigIntHandler.sa_flags = 0;
 
+	// a write to a dead server must fail with EPIPE instead of killing the client
+	signal(SIGPIPE, SIG_IGN);
+
 	verificaRecebimentoParametros(argc);
 
 	servAlive = (ALIVE *)malloc(sizeof(ALIVE));
@@ -263,13 +266,15 @@ void* verificaServer(void* arg){
 		{
 			sleep(1);
 			cout << "send verificacao" << endl;
-			sendMessage("Servidor vivo?", MENSAGEM_VERIFICACAO, servAlive->sockfd); // login message
+			// send-only: the main thread is the only reader of this socket, so reading
+			// a reply here would steal its bytes. a dead server shows up as a failed
+			// write (EPIPE, SIGPIPE is ignored). the file mutex keeps the heartbeat
+			// from landing in the middle of an upload
+			mtx_file_manipulation.lock();
+			result = sendMessage((char*)"Servidor vivo?", MENSAGEM_VERIFICACAO, servAlive->sockfd);
+			mtx_file_manipulation.unlock();
 
-			cout << "read confirmacao" << endl;
-			result = read(servAlive->sockfd, &pack, sizeof(PACKET));
-			cout<<"passou read " << endl;
-
-			if (result <= 0) { //<=
+			if (result < 0) {
 				connected = false;
 				cout<<"change server"<<endl;
 			}
@@ -300,7 +305,10 @@ int download_file_from_server(int sock, string file_path)
 	sendMessage((char *)file_path.c_str(), MENSAGEM_DOWNLOAD_FROM_SERVER, sock);
 
 	cout << "read download name" << endl;
-	readSocket(&pkt, sock);
+	if(readSocket(&pkt, sock) <= 0){
+		cout << "connection to server lost\n";
+		return 1;
+	}
 	if(pkt.type == MENSAGEM_FALHA_ENVIO){
 		cout << "file does not exist on server\n";
 		return 1;
@@ -345,11 +353,21 @@ void *handle_updates(void *arg)
 	while (true)
 	{
 		cout << "handleUpdates function" << endl;
-		readSocket(&pkt, sockfd);
+		if (readSocket(&pkt, sockfd) <= 0)
+		{
+			cout << "sync connection closed" << endl;
+			return 0;
+		}
 		cout << "pkt.type: " << pkt.type << ". ";
 		if (pkt.type == MENSAGEM_DELETAR_NOS_CLIENTES)
 		{
 			string file_name = getFileName(string(pkt._payload));
+			if (!is_valid_file_name(file_name))
+			{
+				// ".." would remove_all() the client's working directory
+				cout << "invalid file name, delete ignored" << endl;
+				continue;
+			}
 
 			string file_path = "./";
 			file_path = file_path + "sync_dir" + "/" + file_name;
@@ -368,6 +386,11 @@ void *handle_updates(void *arg)
 		{
 			string file_name = getFileName(string(pkt._payload));
 			string directory = "./sync_dir/" + file_name;
+			if (!is_valid_file_name(file_name))
+			{
+				cout << "invalid file name, discarding file" << endl;
+				directory = "/dev/null";
+			}
 			mtx_file_manipulation.lock();
 			receiveFile(sockfd, directory, &pkt);
 			latest_downloads.push_back(file_name);

@@ -55,9 +55,21 @@ int readSocket(PACKET *pkt, int sock){
     	/* read from the socket */
 		int result = read(sock, data+n, sizeof(PACKET)-n);
 
-		if (result >= 0)
+		if (result > 0)
 		{
 			n += result;
+		}
+		else if (result == -1 && errno == EINTR)
+		{
+			continue;
+		}
+		else
+		{
+			// 0 = peer closed the connection, -1 = error. returning here instead of
+			// retrying forever is what stops a dead client from pinning a CPU core
+			pkt->type = CONEXAO_ENCERRADA;
+			memset(pkt->_payload, 0, BUFFER_SIZE);
+			return result;
 		}
     }
 
@@ -78,26 +90,45 @@ int readSocket(PACKET *pkt, int sock){
 	return n;
 }
 
-void peekSocket(PACKET *pkt, int sock){
+int peekSocket(PACKET *pkt, int sock){
 	char buffer[sizeof(PACKET)];
 
 	int n = 0;
 
 	while(n < sizeof(PACKET)){
 		n = recv(sock, buffer, sizeof(PACKET), MSG_PEEK);
+		if (n == -1 && errno == EINTR)
+		{
+			n = 0;
+			continue;
+		}
+		if (n <= 0)
+		{
+			pkt->type = CONEXAO_ENCERRADA;
+			memset(pkt->_payload, 0, BUFFER_SIZE);
+			return n;
+		}
 	}
 
 	deserialize(pkt, buffer);
+	return n;
 }
 
-void sendMessage(char message[BUFFER_SIZE], int messageType, int sockfd)
+int sendMessage(char message[BUFFER_SIZE], int messageType, int sockfd)
 {
 	PACKET pkt;
-	
+
 	pkt_mtx.lock();
 	pkt.type = messageType;
 	pkt.seqn = sendpktnum;
-	memcpy(pkt._payload, message, BUFFER_SIZE);
+	if (message == nullptr)
+	{
+		memset(pkt._payload, 0, BUFFER_SIZE);
+	}
+	else
+	{
+		memcpy(pkt._payload, message, BUFFER_SIZE);
+	}
 
 	char data[sizeof(PACKET)];
 
@@ -107,30 +138,26 @@ void sendMessage(char message[BUFFER_SIZE], int messageType, int sockfd)
 
     while(n < sizeof(PACKET))
     {
-    	/* read from the socket */
+    	/* write to the socket */
 		int result = write(sockfd, data+n, sizeof(PACKET)-n);
 
 		if (result >= 0)
 		{
 			n += result;
 		}
+		else if (errno != EINTR)
+		{
+			// connection closed or broken (EPIPE, since SIGPIPE is ignored)
+			printf("ERROR writing to socket\n");
+			pkt_mtx.unlock();
+			return -1;
+		}
     }
-
-	if (n < 0)
-		printf("ERROR writing to socket\n");
-	if (n != sizeof(pkt) || n != sizeof(PACKET)){
-		printf("ERROR writing all data to socket\n");
-		// cout << "n: " << n << endl;
-		// cout << "pkt.type: " << pkt.type << endl;
-		// cout << "pkt._payload: " << pkt._payload << endl;
-		// if(pkt.type == 0 || pkt.type > 60){
-		// 	sleep(60);
-		//}
-	}
 
 	//cout << "pkt.type: " << pkt.type << ". sendpktnum: " << sendpktnum << ". sock: " << sockfd << endl;
 	sendpktnum++;
 	pkt_mtx.unlock();
+	return n;
 }
 
 int connect_to_server(string server_ip, int PORT){
@@ -265,7 +292,7 @@ void sendFile(int sock, string file_path){
 	{
 		cout << "error opening file" << "\n" << endl;
         cout << "write10" << endl;
-        sendMessage(nullptr, MENSAGEM_FALHA_ENVIO, sock);
+        sendMessage((char*) "", MENSAGEM_FALHA_ENVIO, sock);
 		return;
 	}
 
@@ -295,7 +322,12 @@ void sendFile(int sock, string file_path){
 		//}
 		
 		//cout << "write12" << endl;
-		sendMessage(buffer, MENSAGEM_ENVIO_PARTE_ARQUIVO, sock);
+		if (sendMessage(buffer, MENSAGEM_ENVIO_PARTE_ARQUIVO, sock) < 0)
+		{
+			cout << "connection lost while sending file" << endl;
+			file.close();
+			return;
+		}
 	}
 	cout << "write13" << endl;
 	sendMessage(buffer, ACK, sock);
@@ -316,6 +348,29 @@ string getFileName(string file_path){
 		file_name = file_path.substr(last_pos);
 	}
 	return file_name;
+}
+
+bool is_valid_file_name(string file_name){
+	if(file_name.empty() || file_name.size() >= BUFFER_SIZE){
+		return false;
+	}
+	if(file_name == "." || file_name == ".."){
+		return false;
+	}
+	return file_name.find('/') == string::npos;
+}
+
+bool is_valid_username(string username){
+	if(username.empty() || username.size() >= BUFFER_SIZE){
+		return false;
+	}
+	for(int i = 0; i < username.size(); i++){
+		char c = username[i];
+		if(!isalnum((unsigned char) c) && c != '_' && c != '-'){
+			return false;
+		}
+	}
+	return true;
 }
 
 void create_thread(

@@ -1,3 +1,3 @@
-build: 
-	g++ server.cpp     ../login/login.cpp    ../common/common.cpp -o -std=c++17server -lstdc++fs && \
-	g++    ../client/client.cpp     ../common/common.cpp   -o -std=c++17 -lstdc++fs  ../client/client 
+build:
+	g++ -std=c++17 server.cpp ../login/login.cpp ../common/common.cpp -o server -lpthread -lstdc++fs && \
+	g++ -std=c++17 ../client/client.cpp ../common/common.cpp -o ../client/client -lpthread -lstdc++fs

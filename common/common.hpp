@@ -19,10 +19,12 @@
 #include <vector>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <errno.h>
 
 using namespace std;
 
 //messages
+#define CONEXAO_ENCERRADA 0 //not sent on the wire: set by readSocket/peekSocket when the connection is closed
 #define MENSAGEM_LOGIN 1
 #define MENSAGEM_LOGOUT 2
 #define MENSAGEM_USUARIO_INVALIDO 3
@@ -94,13 +96,18 @@ typedef struct server_copy{
 
 void serialize(PACKET *pkt, char data[sizeof(PACKET)]);
 void deserialize(PACKET *pkt, char data[sizeof(PACKET)]);
+//returns <= 0 if the connection was closed or failed (pkt->type is then CONEXAO_ENCERRADA)
 int readSocket(PACKET *pkt, int sock);
-void peekSocket(PACKET *pkt, int sock);
-void sendMessage(char message[BUFFER_SIZE], int messageType, int sockfd);
+int peekSocket(PACKET *pkt, int sock);
+//returns -1 if the connection was closed or failed
+int sendMessage(char message[BUFFER_SIZE], int messageType, int sockfd);
 //returns the amount of bytes written
 void receiveFile(int sock, string file_path, PACKET *pkt_addr);
 void sendFile(int sock, string file_path);
 string getFileName(string file_path);
+//rejects names that could escape the user directory ("", ".", "..", anything with "/")
+bool is_valid_file_name(string file_name);
+bool is_valid_username(string username);
 //returns server socket
 bool has_received_message(int sock);
 int connect_to_server(hostent server_host);

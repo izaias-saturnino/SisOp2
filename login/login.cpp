@@ -60,13 +60,20 @@ void LoginManager::Logout(char user[],int socket, char resposta[]){
             break;
         }
     }
+    bool usuario_encontrado = it != this->listaDeUsuarios.end();
+    bool sem_sessoes = usuario_encontrado && (*it).sessaoAtiva1 == false && (*it).sessaoAtiva2 == false;
     mtx_sessoes.unlock();
 
-    if((*it).sessaoAtiva1 == false && ((*it).sessaoAtiva2 == false)) //sem conexão -> remove da lista
+    if(!usuario_encontrado)
+    {
+        close(socket);
+        strcpy(resposta,"Usuario nao encontrado");
+    }
+    else if(sem_sessoes) //sem conexão -> remove da lista
     {
         strcpy(resposta,"Usuario desconectado");
     }
-    
+
 }
 
 bool LoginManager::login(int socketCli, char nome[], sockaddr_in socketAdr){
@@ -155,12 +162,13 @@ int LoginManager::get_sender_sync_sock(int sock){
         if((*it).socketClient1 == sock){
             sync_sock = (*it).sync1;
             cout << "sync1 não recebe o arquivo. sock: " << (*it).sync1 << endl;
+            break;
         }
         else if((*it).socketClient2 == sock){
             sync_sock = (*it).sync2;
             cout << "sync2 não recebe o arquivo. sock: " << (*it).sync2 << endl;
+            break;
         }
-        break;
     }
     return sync_sock;
 }
